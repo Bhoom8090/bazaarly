@@ -63,7 +63,7 @@ function requireAdmin(req, _res, next) {
   next();
 }
 
-function createApp(name, { rawPaths = [], internalKeyGuard = true } = {}) {
+function createApp(name, { rawPaths = [], internalKeyGuard = true, parseBody = true } = {}) {
   const app = express();
   app.disable('x-powered-by');
 
@@ -87,13 +87,15 @@ function createApp(name, { rawPaths = [], internalKeyGuard = true } = {}) {
     });
   }
 
-  app.use((req, res, next) => {
-    if (rawPaths.some((p) => req.path === p || req.path.startsWith(p))) {
-      express.raw({ type: () => true, limit: '1mb' })(req, res, next);
-    } else {
-      express.json({ limit: '1mb' })(req, res, next);
-    }
-  });
+  if (parseBody) {
+    app.use((req, res, next) => {
+      if (rawPaths.some((p) => req.path === p || req.path.startsWith(p))) {
+        express.raw({ type: () => true, limit: '1mb' })(req, res, next);
+      } else {
+        express.json({ limit: '1mb' })(req, res, next);
+      }
+    });
+  }
 
   app.get('/health', (_req, res) => res.json({ status: 'ok', service: name, uptime: process.uptime() }));
   app.get('/metrics', async (_req, res) => {

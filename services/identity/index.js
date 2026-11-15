@@ -59,8 +59,12 @@ function setAuthCookie(res, token) {
   res.cookie('token', token, { httpOnly: true, sameSite: 'lax', secure: config.cookieSecure, maxAge: 3600 * 1000, path: '/' });
 }
 
+function publicAddress(a) {
+  return { _id: a._id, name: a.name, phone: a.phone, line1: a.line1, line2: a.line2, city: a.city, state: a.state, pincode: a.pincode };
+}
+
 function publicUser(u) {
-  return { id: u._id, email: u.email, name: u.name, role: u.role, addresses: (u.addresses || []).map((a) => ({ ...a, _id: a._id })) };
+  return { id: u._id, email: u.email, name: u.name, role: u.role, addresses: (u.addresses || []).map(publicAddress) };
 }
 
 const registerSchema = z.object({ name: z.string().min(2).max(80), email: z.string().email(), password: z.string().min(8).max(128) });
@@ -124,7 +128,7 @@ app.post('/v1/auth/refresh', asyncH(async (req, res) => {
 app.get('/v1/addresses', requireUser, asyncH(async (req, res) => {
   const user = await User.findById(req.user.id);
   if (!user) throw new HttpError(404, 'NOT_FOUND', 'User not found');
-  res.json({ addresses: (user.addresses || []).map((a) => ({ ...a, _id: a._id })) });
+  res.json({ addresses: (user.addresses || []).map(publicAddress) });
 }));
 
 app.post('/v1/addresses', requireUser, asyncH(async (req, res) => {
@@ -134,7 +138,7 @@ app.post('/v1/addresses', requireUser, asyncH(async (req, res) => {
   user.addresses = user.addresses || [];
   user.addresses.push({ ...data, _id: uuid() });
   await user.save();
-  res.status(201).json({ addresses: user.addresses });
+  res.status(201).json({ addresses: user.addresses.map(publicAddress) });
 }));
 
 app.put('/v1/addresses/:aid', requireUser, asyncH(async (req, res) => {
@@ -145,7 +149,7 @@ app.put('/v1/addresses/:aid', requireUser, asyncH(async (req, res) => {
   Object.assign(addr, data);
   user.markModified('addresses');
   await user.save();
-  res.json({ addresses: user.addresses });
+  res.json({ addresses: user.addresses.map(publicAddress) });
 }));
 
 app.delete('/v1/addresses/:aid', requireUser, asyncH(async (req, res) => {
@@ -154,7 +158,7 @@ app.delete('/v1/addresses/:aid', requireUser, asyncH(async (req, res) => {
   user.addresses = (user.addresses || []).filter((a) => a._id !== req.params.aid);
   user.markModified('addresses');
   await user.save();
-  res.json({ addresses: user.addresses });
+  res.json({ addresses: user.addresses.map(publicAddress) });
 }));
 
 // Internal endpoints (service-to-service only, missing internal key is rejected by createApp)
@@ -167,7 +171,7 @@ app.get('/internal/users/:id/addresses/:aid', asyncH(async (req, res) => {
   const user = await User.findById(req.params.id);
   const addr = user && (user.addresses || []).find((a) => a._id === req.params.aid);
   if (!addr) throw new HttpError(404, 'NOT_FOUND', 'Address not found');
-  res.json({ address: addr });
+  res.json({ address: publicAddress(addr) });
 }));
 
 async function seed() {

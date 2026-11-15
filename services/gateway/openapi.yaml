@@ -54,7 +54,7 @@ paths:
                 password: { type: string }
                 otp: { type: string, description: TOTP code (admin only) }
       responses:
-        '200': { description: Logged in; sets HttpOnly cookie, returns { user, csrfToken } }
+        '200': { description: "Logged in; sets HttpOnly cookie, returns { user, csrfToken }" }
         '401': { description: Invalid credentials or MFA }
   /v1/auth/logout:
     post:
@@ -161,7 +161,7 @@ paths:
   /v1/checkout:
     post:
       tags: [orders]
-      summary: Place an order (saga: reserve -> authorize -> commit -> confirm)
+      summary: "Place an order (saga: reserve -> authorize -> commit -> confirm)"
       description: |
         Requires `Idempotency-Key` header (8–128 chars). Replaying the same key with the
         same body returns the original order with `Idempotent-Replayed: true`.
@@ -234,7 +234,7 @@ paths:
     post:
       tags: [payments]
       summary: PSP webhook receiver (public; HMAC-SHA256 signature verified)
-      description: Header `Stripe-Signature: t=<unix>,v1=<hex>` over `<t>.<rawBody>`, 300s tolerance.
+      description: "Header `Stripe-Signature: t=<unix>,v1=<hex>` over `<t>.<rawBody>`, 300s tolerance."
       parameters: [{ name: provider, in: path, required: true, schema: { type: string } }]
       responses:
         '200': { description: "Received ({ received: true } or { duplicate: true })" }

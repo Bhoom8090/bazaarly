@@ -2,7 +2,7 @@
 // Acceptance tests V-01..V-07, V-10 — run against the running stack.
 // Usage: BASE_URL=http://localhost:8080 node tests/acceptance/run.js
 // (V-08, V-09, V-11 are manual; V-12 is tests/load/load.js.)
-const BASE = process.env.BASE_URL || 'http://localhost:8080';
+const BASE = process.env.BASE_URL || 'http://127.0.0.1:8080';
 const ADMIN_EMAIL = process.env.ADMIN_EMAIL || 'admin@bazaarly.test';
 const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || 'Admin@12345';
 const PSP_WEBHOOK_SECRET = process.env.PSP_WEBHOOK_SECRET || 'whsec_dev_mock_secret';

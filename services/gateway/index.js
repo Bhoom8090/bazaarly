@@ -15,7 +15,9 @@ const config = require('../../shared/config');
 const logger = require('../../shared/logger');
 const { createApp, finish, listen, HttpError } = require('../../shared/http');
 
-const app = createApp('gateway', { internalKeyGuard: false });
+// NOTE: gateway never parses bodies — the proxy must forward the raw stream
+// (webhooks depend on exact bytes for HMAC verification).
+const app = createApp('gateway', { internalKeyGuard: false, parseBody: false });
 const PORT = parseInt(process.env.PORT || '8080', 10);
 const redisClient = new redis(config.redisUrl, { maxRetriesPerRequest: 2 });
 redisClient.on('error', (e) => logger.warn('redis error', { err: e.message }));
@@ -119,8 +121,13 @@ async function handleLogout(req, res, next) {
   } catch (e) { next(e); }
 }
 
-for (const route of routes) {
-  const handler = async (req, res, next) => {
+// Single root-level matcher — do NOT mount handlers with app.use(pattern, ...),
+// because Express strips the matched prefix from req.url for regex mounts, which
+// breaks the proxy path. One middleware, zero path rewriting.
+const mounted = routes.map((route) => ({
+  method: route.method,
+  pattern: route.pattern,
+  handler: async (req, res, next) => {
     try {
       const usingCookie = !!req.cookies?.token && !req.header('authorization');
       let principal = null;
@@ -175,14 +182,19 @@ for (const route of routes) {
     } catch (e) {
       next(e);
     }
-  };
+  },
+}));
 
-  if (route.method) {
-    app[route.method.toLowerCase()](route.pattern, handler);
-  } else {
-    app.use(route.pattern, handler);
+app.use((req, res, next) => {
+  const method = req.method.toUpperCase();
+  const path = req.path; // full path, query already stripped by Express
+  for (const m of mounted) {
+    if (m.method && m.method !== method) continue;
+    if (!m.pattern.test(path)) continue;
+    return m.handler(req, res, next);
   }
-}
+  next(); // no route matched -> 404 in finish()
+});
 
 // OpenAPI docs
 try {

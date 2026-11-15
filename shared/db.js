@@ -4,9 +4,19 @@ const mongoose = require('mongoose');
 const config = require('./config');
 const logger = require('./logger');
 
+function buildUri(base, dbName) {
+  try {
+    const u = new URL(base); // query string preserved, path replaced with /dbName
+    u.pathname = '/' + dbName;
+    return u.toString();
+  } catch {
+    const clean = base.endsWith('/') ? base.slice(0, -1) : base;
+    return `${clean}/${dbName}`;
+  }
+}
+
 async function connectMongo(dbName, { retries = 30, delayMs = 2000 } = {}) {
-  const base = config.mongoUri.endsWith('/') ? config.mongoUri.slice(0, -1) : config.mongoUri;
-  const uri = `${base}/${dbName}`;
+  const uri = buildUri(config.mongoUri, dbName);
   for (let attempt = 1; ; attempt++) {
     try {
       await mongoose.connect(uri, { maxPoolSize: 20, serverSelectionTimeoutMS: 5000 });
