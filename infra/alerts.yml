@@ -1,0 +1,24 @@
+groups:
+  - name: bazaarly.rules
+    rules:
+      - alert: ServiceDown
+        expr: up == 0
+        for: 1m
+        labels: { severity: critical }
+        annotations:
+          summary: "Service {{ $labels.job }} is down"
+          description: "Prometheus cannot scrape {{ $labels.job }}."
+      - alert: EventsDLQIncreasing
+        expr: increase(events_dlq_total[5m]) > 0
+        for: 1m
+        labels: { severity: warning }
+        annotations:
+          summary: "Events are landing in the DLQ"
+          description: "events_dlq_total increased for queue {{ $labels.queue }}. Inspect commerce.dlq in the RabbitMQ UI (http://localhost:15672)."
+      - alert: OutboxBacklogHigh
+        expr: outbox_unpublished > 100
+        for: 2m
+        labels: { severity: warning }
+        annotations:
+          summary: "Outbox backlog > 100 for {{ $labels.service }}"
+          description: "The outbox relay for {{ $labels.service }} is not keeping up."

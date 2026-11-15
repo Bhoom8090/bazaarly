@@ -1,0 +1,195 @@
+BAZAARLY - REPLICATION SPEC
+===========================
+Purpose: paste this whole file into a fresh Claude chat together with the project report PDF and say
+"Build exactly this project. Write files in the order of section 12. Continue from the first missing file."
+Everything needed to rebuild the product is below. Product name: Bazaarly (Amazon-like THEME only).
+
+1. GOAL
+-------
+Implement the report "Scalable Microservices-Based E-Commerce Platform" as a runnable MERN project:
+MongoDB + Express (Node 20) + React (TypeScript, Vite) + Node microservices. Single merchant, INR currency,
+sandbox payments only, simulated carrier. Git-ready repo, Docker Compose first, zipped, with README.
+Deviation from report (declared): PostgreSQL -> MongoDB (user asked MERN). Mongo runs as a 1-node replica set
+so multi-document transactions (outbox) work. Redis for cart + cache. RabbitMQ topic exchange as broker.
+
+2. REPO LAYOUT
+--------------
+bazaarly/
+  package.json (+lock)        root deps for ALL backend services (one install, Docker copies it)
+  Dockerfile.service          generic: ARG SERVICE -> node services/$SERVICE/index.js
+  docker-compose.yml  .env.example  .gitignore  .dockerignore  README.md
+  shared/  config.js logger.js http.js db.js events.js topology.js clients.js money.js fsm.js idem.js webhook.js
+  services/ gateway identity catalog search inventory cart order payment notification fulfilment mock-psp
+  frontend/ (Vite React TS, nginx Dockerfile, nginx.conf)
+  infra/ prometheus.yml alerts.yml grafana/{provisioning,dashboards}
+  tests/ unit/*.test.js (jest)  acceptance/run.js (V-01..V-10 against running stack)  load/load.js (V-12)
+  scripts/ backup-restore.sh (V-11)  check-syntax.js
+  docs/REPLICATION_SPEC.txt   .github/workflows/ci.yml
+
+3. PORTS / URLS
+---------------
+frontend nginx 3000 (proxies /api/ -> gateway, strips prefix) | gateway 8080 (+ /api-docs Swagger, /health, /metrics)
+identity 4001 | catalog 4002 | search 4003 | inventory 4004 | cart 4005 | order 4006 | payment 4007
+notification 4008 | fulfilment 4009 | mock-psp 4010 | mongo 27017 | redis 6379 | rabbitmq 5672 (UI 15672)
+mailpit SMTP 1025 UI 8025 | prometheus 9090 | grafana 3001 (admin/admin)
+Only gateway/frontend/tools are published; services are reachable only inside the Docker network.
+
+4. ENV (.env.example)
+---------------------
+JWT_SECRET, INTERNAL_KEY (gateway adds x-internal-key; every service rejects calls without it except /health /metrics),
+PSP_WEBHOOK_SECRET=whsec_dev_mock_secret, PSP_API_KEY=sk_test_mock, COOKIE_SECURE=false,
+ADMIN_EMAIL=admin@bazaarly.test ADMIN_PASSWORD=Admin@12345 DEMO_EMAIL=demo@bazaarly.test DEMO_PASSWORD=Demo@12345,
+ADMIN_MFA_ENFORCE=false ADMIN_TOTP_SECRET=JBSWY3DPEHPK3PXP, RESERVATION_TTL_SECONDS=600, EVENT_MAX_ATTEMPTS=5,
+RATE_LIMIT_PER_MIN=1000, AUTH_RATE_LIMIT_PER_MIN=200, PAYMENT_SANDBOX=true, MAX_CART_QTY=10,
+MONGO_URI=mongodb://mongo:27017/?replicaSet=rs0, REDIS_URL=redis://redis:6379, AMQP_URL=amqp://guest:guest@rabbitmq:5672,
+SMTP_HOST=mailpit, PSP_WEBHOOK_URL=http://gateway:8080/v1/webhooks/payments/mockpsp
+Service URLs default in shared/config.js to http://<service>:<port>.
+
+5. SHARED LIBRARY BEHAVIOUR
+---------------------------
+http.js: createApp(name,{rawPaths}) = express + correlation-id (x-correlation-id) + Prometheus histogram
+  http_request_duration_seconds + /health + /metrics + internal-key check + json/raw body parsing; HttpError, asyncH,
+  zod validate(), requireUser/requireAdmin (read x-user-id, x-user-role), finish() = 404 + error handler, listen().
+db.js: connectMongo(dbName) retry loop; withTxn(client,fn) (majority transactions); TxnAbort(result) to abort+return.
+events.js: envelope {event_id,event_type("Name.v1"),schema_version,occurred_at,producer,aggregate_id,correlation_id,
+  causation_id,payload}. Transactional outbox: addOutbox(db,session,evt) inside the business transaction; relay every
+  1s publishes unpublished rows in order, marks published (TTL 7d); duplicates possible. Consumers: consume(queue,db,handler)
+  with processed_events dedupe, retry via "<queue>.retry" queue (per-message TTL = exponential backoff + jitter),
+  after EVENT_MAX_ATTEMPTS -> queue commerce.dlq + Prometheus counter events_dlq_total. Auto-reconnect to broker.
+topology.js: every service declares ALL queues+bindings on connect (idempotent) so no event is lost on startup order.
+clients.js: callService(base,path,{method,body,cid,user,timeoutMs,retries,internal,headers}) with timeout, retry w/
+  backoff+jitter on network/5xx, per-host circuit breaker (5 failures -> open 10s), returns {ok,status,data}.
+money.js: priceLines(lines,productsBySku): server repricing; shipping Rs40 if subtotal < Rs499; tax 18% inclusive;
+  all integers in paise. fsm.js: ORDER / PAYMENT / SHIPMENT transition maps. idem.js: stable hash of body.
+webhook.js: HMAC-SHA256 header "t=<unix>,v1=<hex>" over "<t>.<rawBody>", 300s tolerance, timing-safe compare.
+logger.js: JSON logs, redacts keys matching pan|cvv|card|password|secret|token|authorization|cookie.
+
+6. EVENT TOPOLOGY (queue -> bindings)
+-------------------------------------
+search.product-changed: ProductChanged.v1
+inventory.product-changed: ProductChanged.v1   (creates balance from payload.initialStock when SKU new)
+inventory.order-cancelled: OrderCancelled.v1   (release reservations)
+order.inventory-events: InventoryReserved.v1, ReservationExpired.v1
+order.payment-events: PaymentAuthorized.v1, PaymentFailed.v1
+order.tracking: TrackingUpdated.v1
+payment.order-cancelled: OrderCancelled.v1 (void) | payment.order-confirmed: OrderConfirmed.v1 (capture)
+notification.events: PaymentAuthorized, PaymentFailed, OrderConfirmed, OrderCancelled, TrackingUpdated (all .v1)
+fulfilment.order-confirmed: OrderConfirmed.v1 | cart.order-confirmed: OrderConfirmed.v1 (clear cart)
+Exchange "commerce.events" (topic, durable); routing key = event_type.
+
+7. SERVICES (each owns its Mongo database, noted in brackets)
+-------------------------------------------------------------
+gateway: no body parsing, proxies by route table. Strips inbound x-user-*/x-internal-key; verifies JWT (cookie "token" or
+  Bearer) + Redis revocation list (revoked:<jti>); admin routes need role admin; CSRF: cookie-authenticated mutating
+  requests need header X-CSRF-Token == claim csrf; Redis fixed-window rate limits (global per IP, auth, checkout 10/min/user,
+  search); adds x-user-id/x-user-role/x-user-csrf/x-internal-key/x-correlation-id. POST /v1/auth/logout revokes jti.
+  Routes: /v1/auth/(register|login) public; /v1/auth/(session|refresh), /v1/addresses -> identity; GET /v1/products,
+  /v1/categories -> catalog; GET /v1/search -> search; GET /v1/availability -> inventory; /v1/cart -> cart;
+  POST /v1/checkout, /v1/orders -> order; /v1/orders/:id/tracking -> fulfilment (must match before /v1/orders);
+  /v1/notifications -> notification; /v1/webhooks/payments/:provider -> payment (public, signature-verified);
+  admin: /v1/admin/products + /v1/admin/audit -> catalog; /v1/admin/inventory* -> inventory; /v1/admin/orders -> order;
+  /v1/admin/shipments -> fulfilment; /v1/admin/search/reindex -> search. OpenAPI 3.1 file served at /api-docs.
+identity [identity]: users{_id uuid,email unique,name,passwordHash bcryptjs,role customer|admin,addresses[],totpSecret}.
+  register/login set HttpOnly SameSite=Lax cookie "token" (JWT 1h: sub,role,csrf,jti) and return {user,csrfToken}.
+  Admin login needs "otp" (otplib TOTP) only if ADMIN_MFA_ENFORCE=true. GET /v1/auth/session, POST /v1/auth/refresh (rotates),
+  addresses CRUD (name,phone 10 digits,line1,line2,city,state,pincode 6 digits). Internal: /internal/users/:id,
+  /internal/users/:id/addresses/:aid. Seeds admin + demo customer (with one address).
+catalog [catalog]: products{_id productId "p_0001",sku "BZ-ELEC-0001",title,brand,category,description,price paise,
+  currency INR,emoji,color,status active|inactive,version}. GET /v1/products?category&cursor&limit<=40 (cursor pagination by id,
+  active only, Redis cache 30s, invalidated on admin change), GET /v1/products/:id, GET /v1/categories,
+  internal GET /internal/products?skus=a,b | ?all=1&cursor=. Admin create/update (reason, optimistic expectedVersion,
+  version++), audit collection, every change = transaction {product, audit, outbox ProductChanged.v1}. Seeds 25 products in 6
+  categories (Electronics, Books, Home & Kitchen, Fashion, Toys & Games, Sports & Fitness) with emoji+colour art, one low stock,
+  one out of stock.
+search [search]: projection of ProductChanged.v1 (version-guarded upsert), text index, GET /v1/search?q&category&minPrice&maxPrice
+  &sort(relevance|price_asc|price_desc)&cursor&limit -> {items,total,facets.categories,nextCursor}; q max 100 chars,
+  limit<=40; regex fallback when $text finds nothing; reindex from catalog at startup and via admin endpoint (rebuildable).
+inventory [inventory]: balances{sku,location MAIN,onHand,reserved,version} available=onHand-reserved never negative;
+  reservations{_id,orderId,sku,quantity,state ACTIVE|COMMITTED|RELEASED|EXPIRED,expiresAt} unique(orderId,sku).
+  POST /internal/reservations {orderId,items,ttlSeconds}: one transaction, guarded findOneAndUpdate with
+  $expr(onHand-reserved >= qty) per item, all-or-nothing, idempotent per orderId, writes outbox InventoryReserved.v1; 409 +
+  {unavailable:[sku]}. POST /internal/reservations/:orderId/commit | /release (guarded ACTIVE->terminal transition; commit
+  409 if released/expired). Expiry worker every 15s releases expired ACTIVE holds -> ReservationExpired.v1. GET /v1/availability
+  ?skus= (IN_STOCK|LOW(<=5, shows count)|OUT_OF_STOCK, no exact numbers otherwise). Admin POST /v1/admin/inventory-adjustments
+  {sku,delta,reason>=3 chars,confirmLarge required if |delta|>100}, audit trail, GET /v1/admin/inventory, GET .../inventory-adjustments.
+cart [Redis hash cart:<userId>, TTL 7d]: GET /v1/cart (reprices through catalog every read), PUT /v1/cart/items/:sku {quantity 0..10;
+  0 removes}, DELETE /v1/cart; owner always taken from principal; max 50 distinct SKUs; internal GET/DELETE /internal/carts/:userId.
+order [orders]: orders{_id "402-1234567-1234567",customerId,state,items snapshot,address snapshot,pricing,history[],
+  paymentAuthorized,reservationExpiresAt}, idempotency_keys{_id "<user>:<key>",hash,orderId}, security_audit.
+  POST /v1/checkout (requires Idempotency-Key 8-128 chars, body {addressId,paymentScenario success|failure|async|timeout}):
+  same key+same body -> same logical order (Idempotent-Replayed header); same key+different body -> 409 IDEMPOTENCY_KEY_REUSED.
+  Orchestrated saga: validate -> cart/address/reprice -> order PENDING_VALIDATION -> reserve stock (409 -> CANCELLED OUT_OF_STOCK)
+  -> INVENTORY_RESERVED -> PAYMENT_PENDING -> payment authorize (sync result, else wait for webhook/reconciliation) -> on AUTHORIZED
+  commit reservation then CONFIRMED + outbox OrderConfirmed.v1 (one transaction). Failure/expiry -> state change + outbox
+  OrderCancelled.v1 (reasons PAYMENT_FAILED, OUT_OF_STOCK, EXPIRED, RESERVATION_LOST, CHECKOUT_INCOMPLETE) -> inventory releases,
+  payment voids. Late authorization on dead order -> void. HTTP codes: confirmed 201, pending 202, PAYMENT_FAILED 402,
+  CANCELLED/EXPIRED 409. Sweeper every 15s: retry commit for authorized-but-unconfirmed, cancel PENDING_VALIDATION older than 120s.
+  Consumes payment events, ReservationExpired, InventoryReserved, TrackingUpdated (forward-only FULFILLING/SHIPPED/DELIVERED).
+  GET /v1/orders, GET /v1/orders/:id (owner or admin, else 404 + security_audit row), GET /v1/admin/orders?state=.
+payment [payments]: payment_attempts{orderId unique,idemKey "order-<id>",providerRef,status CREATED|PROCESSING|AUTHORIZED|CAPTURED|
+  FAILED|VOIDED (guarded transitions; terminal wins once)}, webhook_events{_id eventId} dedupe. Adapter calls mock PSP with stable
+  Idempotency-Key, 3s timeout. POST /internal/payments/authorize|void. Webhook POST /v1/webhooks/payments/:provider: raw body,
+  verify signature+timestamp, persist then process, duplicate -> {duplicate:true}, stale/out-of-order ignored, authorized-after-void
+  -> cancel at PSP. Reconciler every 10s queries PSP by idempotency key for stale CREATED/PROCESSING (re-posts same key if PSP
+  never saw it). Captures on OrderConfirmed, voids on OrderCancelled. Emits PaymentAuthorized.v1/PaymentFailed.v1 via outbox.
+  No PAN/CVV anywhere.
+mock-psp (in-memory, clearly labelled MOCK): POST /psp/v1/payment_intents (Idempotency-Key replay), GET by id / ?idempotency_key=,
+  capture, cancel; Bearer PSP_API_KEY. Scenarios: success (authorized + webhook sent twice), failure (card_declined + webhook),
+  async (processing, authorized+webhook after 5s), timeout (authorized but HTTP response delayed 8s, NO webhook -> forces reconcile).
+  Webhooks signed with PSP_WEBHOOK_SECRET, posted to PSP_WEBHOOK_URL.
+notification [notifications]: inbox{userId,orderId,subject,body,readAt,emailSent,dedupeKey unique per user}, preferences,
+  delivery_attempts. Email through nodemailer -> Mailpit; failure throws -> retry/backoff -> DLQ; order state never affected.
+  GET /v1/notifications (+unreadCount), POST /v1/notifications/:id/read, /read-all, GET/PUT /v1/notifications/preferences{email}.
+fulfilment [fulfilment]: shipments{_id "SHP-<orderId>",orderId unique,customerId,state CREATED|LABELLED|IN_TRANSIT|OUT_FOR_DELIVERY|
+  DELIVERED|EXCEPTION|RETURNED,events[] append-only with eventId dedupe}. Created on OrderConfirmed.v1; admin POST
+  /v1/admin/shipments/:orderId/events {status,note,eventId?} (guarded transitions, outbox TrackingUpdated.v1);
+  GET /v1/orders/:id/tracking (owner only), GET /v1/admin/shipments.
+
+8. STATE MACHINES
+-----------------
+Order: PENDING_VALIDATION -> INVENTORY_RESERVED -> PAYMENT_PENDING -> CONFIRMED -> FULFILLING -> SHIPPED -> DELIVERED;
+  failure/terminal: CANCELLED, PAYMENT_FAILED, EXPIRED.
+Payment: CREATED -> PROCESSING -> AUTHORIZED -> CAPTURED ; FAILED, VOIDED. Reservation: ACTIVE -> COMMITTED | RELEASED | EXPIRED.
+Shipment: see fulfilment above.
+
+9. FRONTEND (React 18 + TS + Vite + react-router, no UI lib)
+-------------------------------------------------------------
+Amazon-like theme (own CSS): dark navy header #131921 with orange accent, search bar with category select, sub-nav #232f3e,
+page background #eaeded, white cards, yellow "Add to Cart" #ffd814, orange "Buy Now" #ffa41c, price colour #b12704, link #007185.
+Products drawn as gradient SVG tiles with emoji (no external images). Accessible: skip link, labels, focus rings,
+aria-live status region, keyboard operable forms.
+Routes: / home (hero, category tiles, products) | /c/:category (catalog browse, load more) | /search (facets, sort, price filter) |
+/p/:id product page + buy box (availability from /v1/availability) | /cart | /checkout (address, sandbox payment scenario select,
+review, Place order with persisted Idempotency-Key and "retry with same key" on network failure) | /orders | /orders/:id
+(status tracker, pricing, state-history trace, shipment milestones, polls every 3s while pending) | /notifications | /login
+| /register | /admin (Products, Inventory, Orders, Shipments, System tabs; admin role only).
+Frontend calls /api/... with credentials + X-CSRF-Token; session loaded from GET /v1/auth/session.
+
+10. OBSERVABILITY / OPS
+-----------------------
+Prometheus scrapes every service /metrics; alert rules: service down, events_dlq_total increase, outbox_unpublished > 100.
+Grafana provisioned datasource + small dashboard (request rate, p95, DLQ, outbox backlog). OpenTelemetry tracing is replaced by
+correlation-id propagation across HTTP + events + JSON logs (declared deviation). RabbitMQ UI shows commerce.dlq.
+
+11. TESTS
+---------
+Unit (jest): money, webhook signature, circuit breaker, FSM, idempotency hash.
+Acceptance (node tests/acceptance/run.js, stack running): V-01 browse pagination + inactive hidden, V-02 50 parallel checkouts for stock=1
+  -> exactly one succeeds, V-03 same key twice -> one order, V-04 key reuse with different body -> 409, V-05 timeout scenario
+  reconciles to CONFIRMED, V-06 failure scenario releases stock once, V-07 bad signature rejected + duplicate webhook no-op,
+  V-10 cross-user order read denied. Manual: V-08 (stop rabbitmq during checkout), V-09 (stop mailpit), V-11 scripts/backup-restore.sh.
+Load (V-12): node tests/load/load.js -> p50/p95/p99, errors, rps, JSON saved.
+
+12. BUILD ORDER (resume from first missing file)
+------------------------------------------------
+1 root package.json, .env.example, .gitignore, Dockerfile.service  2 shared/*  3 mock-psp  4 identity  5 catalog  6 search
+7 inventory  8 cart  9 payment  10 order  11 fulfilment  12 notification  13 gateway (+openapi.yaml)  14 infra/*  15 docker-compose.yml
+16 frontend  17 tests + scripts  18 README + CI  19 npm install (lockfiles), syntax check, unit tests, frontend build
+20 git init -b main && commit  21 zip (exclude node_modules, dist)  22 give user run instructions.
+
+13. RUN (Windows/macOS/Linux with Docker Desktop)
+-------------------------------------------------
+cp .env.example .env   (Windows cmd: copy .env.example .env)  |  docker compose up --build  |  open http://localhost:3000
+Demo login demo@bazaarly.test / Demo@12345 ; admin admin@bazaarly.test / Admin@12345 ; Swagger http://localhost:8080/api-docs
+Mailpit http://localhost:8025 ; RabbitMQ http://localhost:15672 (guest/guest) ; Grafana http://localhost:3001 ; Prometheus :9090
+Stop: docker compose down (add -v to wipe data).

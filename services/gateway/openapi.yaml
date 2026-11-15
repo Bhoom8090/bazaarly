@@ -1,0 +1,305 @@
+openapi: 3.1.0
+info:
+  title: Bazaarly API
+  version: 1.0.0
+  description: |
+    Bazaarly — single-merchant e-commerce API (INR, sandbox payments).
+    Amazon-like theme. All amounts are integer paise; currency is always INR.
+    Auth: HttpOnly cookie `token` (JWT) or `Authorization: Bearer <jwt>`.
+    Cookie-authenticated mutating requests must send `X-CSRF-Token` matching the `csrf` claim.
+    Idempotent checkout requires `Idempotency-Key` (8–128 chars).
+servers:
+  - url: http://localhost:8080
+    description: Local dev (through Docker network or published gateway port)
+tags:
+  - name: auth
+  - name: catalog
+  - name: cart
+  - name: orders
+  - name: payments
+  - name: notifications
+  - name: admin
+paths:
+  /v1/auth/register:
+    post:
+      tags: [auth]
+      summary: Register a customer account
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [name, email, password]
+              properties:
+                name: { type: string, minLength: 2 }
+                email: { type: string, format: email }
+                password: { type: string, minLength: 8 }
+      responses:
+        '201': { description: Created, headers: { 'Set-Cookie': { schema: { type: string } } } }
+        '409': { description: Email already registered }
+  /v1/auth/login:
+    post:
+      tags: [auth]
+      summary: Log in (admins may need `otp` when ADMIN_MFA_ENFORCE=true)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [email, password]
+              properties:
+                email: { type: string, format: email }
+                password: { type: string }
+                otp: { type: string, description: TOTP code (admin only) }
+      responses:
+        '200': { description: Logged in; sets HttpOnly cookie, returns { user, csrfToken } }
+        '401': { description: Invalid credentials or MFA }
+  /v1/auth/logout:
+    post:
+      tags: [auth]
+      summary: Log out; revokes the token (jti denylist in Redis)
+      responses:
+        '200': { description: Logged out }
+  /v1/auth/session:
+    get:
+      tags: [auth]
+      summary: Current session
+      responses:
+        '200': { description: "{ authenticated: boolean, user?, csrfToken? }" }
+  /v1/auth/refresh:
+    post:
+      tags: [auth]
+      summary: Rotate JWT (new cookie)
+      responses:
+        '200': { description: Refreshed }
+  /v1/addresses:
+    get:
+      tags: [auth]
+      summary: List my addresses
+      responses: { '200': { description: Addresses } }
+    post:
+      tags: [auth]
+      summary: Add an address
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Address' }
+      responses: { '201': { description: Created } }
+  /v1/addresses/{aid}:
+    put:
+      tags: [auth]
+      summary: Update an address
+      parameters: [{ name: aid, in: path, required: true, schema: { type: string } }]
+      responses: { '200': { description: Updated }, '404': { description: Not found } }
+    delete:
+      tags: [auth]
+      summary: Delete an address
+      parameters: [{ name: aid, in: path, required: true, schema: { type: string } }]
+      responses: { '200': { description: Deleted } }
+  /v1/products:
+    get:
+      tags: [catalog]
+      summary: List products (cursor pagination, active only)
+      parameters:
+        - { name: category, in: query, schema: { type: string } }
+        - { name: cursor, in: query, schema: { type: string } }
+        - { name: limit, in: query, schema: { type: integer, maximum: 40, default: 12 } }
+      responses: { '200': { description: "{ items: Product[], nextCursor: string|null }" } }
+  /v1/products/{id}:
+    get:
+      tags: [catalog]
+      summary: Product detail
+      parameters: [{ name: id, in: path, required: true, schema: { type: string } }]
+      responses: { '200': { description: Product }, '404': { description: Not found } }
+  /v1/categories:
+    get:
+      tags: [catalog]
+      summary: Category list with counts
+      responses: { '200': { description: Categories } }
+  /v1/search:
+    get:
+      tags: [catalog]
+      summary: Full-text search with facets
+      parameters:
+        - { name: q, in: query, schema: { type: string, maxLength: 100 } }
+        - { name: category, in: query, schema: { type: string } }
+        - { name: minPrice, in: query, schema: { type: integer } }
+        - { name: maxPrice, in: query, schema: { type: integer } }
+        - { name: sort, in: query, schema: { type: string, enum: [relevance, price_asc, price_desc] } }
+        - { name: cursor, in: query, schema: { type: string } }
+        - { name: limit, in: query, schema: { type: integer, maximum: 40 } }
+      responses: { '200': { description: "{ items, total, facets, nextCursor }" } }
+  /v1/availability:
+    get:
+      tags: [catalog]
+      summary: Availability for SKUs (never reveals exact reserved counts)
+      parameters: [{ name: skus, in: query, required: true, schema: { type: string }, example: "BZ-ELEC-0002,BZ-BOOK-0001" }]
+      responses: { '200': { description: "{ availability: { [sku]: { status: IN_STOCK|LOW|OUT_OF_STOCK, count? } } }" } }
+  /v1/cart:
+    get:
+      tags: [cart]
+      summary: Get my cart (repriced server-side)
+      responses: { '200': { description: "{ items, pricing, count }" } }
+    delete:
+      tags: [cart]
+      summary: Clear my cart
+      responses: { '200': { description: Cleared } }
+  /v1/cart/items/{sku}:
+    put:
+      tags: [cart]
+      summary: Set item quantity (0 removes; max 10 per SKU; max 50 distinct SKUs)
+      parameters: [{ name: sku, in: path, required: true, schema: { type: string } }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { type: object, required: [quantity], properties: { quantity: { type: integer, minimum: 0, maximum: 10 } } }
+      responses: { '200': { description: Updated cart } }
+  /v1/checkout:
+    post:
+      tags: [orders]
+      summary: Place an order (saga: reserve -> authorize -> commit -> confirm)
+      description: |
+        Requires `Idempotency-Key` header (8–128 chars). Replaying the same key with the
+        same body returns the original order with `Idempotent-Replayed: true`.
+        Same key with a different body returns 409 IDEMPOTENCY_KEY_REUSED.
+        paymentScenario: success | failure | async | timeout (sandbox only).
+      parameters: [{ name: Idempotency-Key, in: header, required: true, schema: { type: string, minLength: 8, maxLength: 128 } }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [addressId, paymentScenario]
+              properties:
+                addressId: { type: string }
+                paymentScenario: { type: string, enum: [success, failure, async, timeout] }
+      responses:
+        '201': { description: Order confirmed }
+        '202': { description: Order pending (async/timeout payment) }
+        '402': { description: Payment failed }
+        '409': { description: Out of stock / cancelled / key reused }
+  /v1/orders:
+    get:
+      tags: [orders]
+      summary: My orders
+      responses: { '200': { description: Orders } }
+  /v1/orders/{id}:
+    get:
+      tags: [orders]
+      summary: Order detail (owner or admin; 404 otherwise)
+      parameters: [{ name: id, in: path, required: true, schema: { type: string } }]
+      responses: { '200': { description: Order }, '404': { description: Not found / not yours } }
+  /v1/orders/{id}/tracking:
+    get:
+      tags: [orders]
+      summary: Shipment milestones for my order
+      parameters: [{ name: id, in: path, required: true, schema: { type: string } }]
+      responses: { '200': { description: Tracking }, '404': { description: Not found / not yours } }
+  /v1/notifications:
+    get:
+      tags: [notifications]
+      summary: My inbox + unreadCount
+      responses: { '200': { description: Notifications } }
+  /v1/notifications/read-all:
+    post:
+      tags: [notifications]
+      summary: Mark all as read
+      responses: { '200': { description: OK } }
+  /v1/notifications/{id}/read:
+    post:
+      tags: [notifications]
+      summary: Mark one as read
+      parameters: [{ name: id, in: path, required: true, schema: { type: string } }]
+      responses: { '200': { description: OK } }
+  /v1/notifications/preferences:
+    get:
+      tags: [notifications]
+      summary: Get notification preferences
+      responses: { '200': { description: Preferences } }
+    put:
+      tags: [notifications]
+      summary: Update notification preferences
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { type: object, properties: { email: { type: boolean } } }
+      responses: { '200': { description: Updated } }
+  /v1/webhooks/payments/{provider}:
+    post:
+      tags: [payments]
+      summary: PSP webhook receiver (public; HMAC-SHA256 signature verified)
+      description: Header `Stripe-Signature: t=<unix>,v1=<hex>` over `<t>.<rawBody>`, 300s tolerance.
+      parameters: [{ name: provider, in: path, required: true, schema: { type: string } }]
+      responses:
+        '200': { description: "Received ({ received: true } or { duplicate: true })" }
+        '400': { description: Bad signature / body }
+  /v1/admin/products:
+    post:
+      tags: [admin]
+      summary: Create product (admin; emits ProductChanged.v1)
+      responses: { '201': { description: Created } }
+  /v1/admin/products/{id}:
+    put:
+      tags: [admin]
+      summary: Update product (admin; optimistic concurrency via expectedVersion)
+      parameters: [{ name: id, in: path, required: true, schema: { type: string } }]
+      responses: { '200': { description: Updated }, '409': { description: Version conflict } }
+  /v1/admin/inventory:
+    get:
+      tags: [admin]
+      summary: List balances (admin)
+      responses: { '200': { description: Balances } }
+  /v1/admin/inventory-adjustments:
+    post:
+      tags: [admin]
+      summary: Adjust stock (admin; |delta|>100 requires confirmLarge=true)
+      responses: { '201': { description: Adjusted }, '400': { description: Confirmation required } }
+    get:
+      tags: [admin]
+      summary: Adjustment audit trail (admin)
+      responses: { '200': { description: Adjustments } }
+  /v1/admin/orders:
+    get:
+      tags: [admin]
+      summary: List orders (admin; ?state= filter)
+      responses: { '200': { description: Orders } }
+  /v1/admin/shipments/{orderId}/events:
+    post:
+      tags: [admin]
+      summary: Append shipment milestone (admin; guarded transitions)
+      parameters: [{ name: orderId, in: path, required: true, schema: { type: string } }]
+      responses: { '201': { description: Event appended }, '409': { description: Illegal transition } }
+  /v1/admin/shipments:
+    get:
+      tags: [admin]
+      summary: List shipments (admin)
+      responses: { '200': { description: Shipments } }
+  /v1/admin/search/reindex:
+    post:
+      tags: [admin]
+      summary: Rebuild the search projection from the catalog (admin)
+      responses: { '200': { description: Reindexed } }
+  /v1/admin/audit:
+    get:
+      tags: [admin]
+      summary: Catalogue audit log (admin)
+      responses: { '200': { description: Audit rows } }
+components:
+  schemas:
+    Address:
+      type: object
+      required: [name, phone, line1, city, state, pincode]
+      properties:
+        name: { type: string }
+        phone: { type: string, pattern: '^[0-9]{10}$' }
+        line1: { type: string }
+        line2: { type: string }
+        city: { type: string }
+        state: { type: string }
+        pincode: { type: string, pattern: '^[0-9]{6}$' }

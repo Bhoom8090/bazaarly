@@ -1,0 +1,246 @@
+name: bazaarly
+
+x-service-common: &service-common
+  build:
+    context: .
+    dockerfile: Dockerfile.service
+  depends_on:
+    mongo-init:
+      condition: service_completed_successfully
+    redis:
+      condition: service_started
+    rabbitmq:
+      condition: service_started
+  environment: &service-env
+    MONGO_URI: mongodb://mongo:27017/?replicaSet=rs0
+    REDIS_URL: redis://redis:6379
+    AMQP_URL: amqp://guest:guest@rabbitmq:5672
+    SMTP_HOST: mailpit
+    SMTP_PORT: 1025
+    JWT_SECRET: ${JWT_SECRET:-dev_jwt_secret_change_me_in_production_0123456789abcdef}
+    INTERNAL_KEY: ${INTERNAL_KEY:-dev_internal_key_change_me_0123456789abcdef}
+    PSP_WEBHOOK_SECRET: ${PSP_WEBHOOK_SECRET:-whsec_dev_mock_secret}
+    PSP_API_KEY: ${PSP_API_KEY:-sk_test_mock}
+    PSP_WEBHOOK_URL: ${PSP_WEBHOOK_URL:-http://gateway:8080/v1/webhooks/payments/mockpsp}
+    COOKIE_SECURE: ${COOKIE_SECURE:-false}
+    ADMIN_EMAIL: ${ADMIN_EMAIL:-admin@bazaarly.test}
+    ADMIN_PASSWORD: ${ADMIN_PASSWORD:-Admin@12345}
+    DEMO_EMAIL: ${DEMO_EMAIL:-demo@bazaarly.test}
+    DEMO_PASSWORD: ${DEMO_PASSWORD:-Demo@12345}
+    ADMIN_MFA_ENFORCE: ${ADMIN_MFA_ENFORCE:-false}
+    ADMIN_TOTP_SECRET: ${ADMIN_TOTP_SECRET:-JBSWY3DPEHPK3PXP}
+    RESERVATION_TTL_SECONDS: ${RESERVATION_TTL_SECONDS:-600}
+    EVENT_MAX_ATTEMPTS: ${EVENT_MAX_ATTEMPTS:-5}
+    RATE_LIMIT_PER_MIN: ${RATE_LIMIT_PER_MIN:-1000}
+    AUTH_RATE_LIMIT_PER_MIN: ${AUTH_RATE_LIMIT_PER_MIN:-200}
+    PAYMENT_SANDBOX: ${PAYMENT_SANDBOX:-true}
+    MAX_CART_QTY: ${MAX_CART_QTY:-10}
+    IDENTITY_URL: http://identity:4001
+    CATALOG_URL: http://catalog:4002
+    SEARCH_URL: http://search:4003
+    INVENTORY_URL: http://inventory:4004
+    CART_URL: http://cart:4005
+    ORDER_URL: http://order:4006
+    PAYMENT_URL: http://payment:4007
+    NOTIFICATION_URL: http://notification:4008
+    FULFILMENT_URL: http://fulfilment:4009
+    MOCK_PSP_URL: http://mock-psp:4010
+
+services:
+  mongo:
+    image: mongo:7
+    command: ["mongod", "--replSet", "rs0", "--bind_ip_all"]
+    healthcheck:
+      test: ["CMD", "mongosh", "--quiet", "--eval", "db.adminCommand('ping').ok"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+    volumes:
+      - mongo-data:/data/db
+
+  mongo-init:
+    image: mongo:7
+    depends_on:
+      mongo:
+        condition: service_healthy
+    command: >
+      mongosh --host mongo:27017 --quiet --eval "
+        try { rs.status().ok && print('replica set already initialised'); }
+        catch (e) { rs.initiate({_id: 'rs0', members: [{_id: 0, host: 'mongo:27017'}]}); print('replica set initialised'); }
+      "
+
+  redis:
+    image: redis:7-alpine
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  rabbitmq:
+    image: rabbitmq:3.13-management-alpine
+    ports:
+      - "15672:15672"   # management UI (guest/guest)
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 20
+
+  mailpit:
+    image: axllent/mailpit:latest
+    ports:
+      - "1025:1025"   # SMTP
+      - "8025:8025"   # UI
+
+  mock-psp:
+    <<: *service-common
+    build:
+      context: .
+      dockerfile: Dockerfile.service
+      args: { SERVICE: mock-psp }
+    environment:
+      <<: *service-env
+      PORT: 4010
+
+  identity:
+    <<: *service-common
+    build:
+      context: .
+      dockerfile: Dockerfile.service
+      args: { SERVICE: identity }
+    environment:
+      <<: *service-env
+      PORT: 4001
+
+  catalog:
+    <<: *service-common
+    build:
+      context: .
+      dockerfile: Dockerfile.service
+      args: { SERVICE: catalog }
+    environment:
+      <<: *service-env
+      PORT: 4002
+
+  search:
+    <<: *service-common
+    build:
+      context: .
+      dockerfile: Dockerfile.service
+      args: { SERVICE: search }
+    environment:
+      <<: *service-env
+      PORT: 4003
+
+  inventory:
+    <<: *service-common
+    build:
+      context: .
+      dockerfile: Dockerfile.service
+      args: { SERVICE: inventory }
+    environment:
+      <<: *service-env
+      PORT: 4004
+
+  cart:
+    <<: *service-common
+    build:
+      context: .
+      dockerfile: Dockerfile.service
+      args: { SERVICE: cart }
+    environment:
+      <<: *service-env
+      PORT: 4005
+
+  order:
+    <<: *service-common
+    build:
+      context: .
+      dockerfile: Dockerfile.service
+      args: { SERVICE: order }
+    environment:
+      <<: *service-env
+      PORT: 4006
+
+  payment:
+    <<: *service-common
+    build:
+      context: .
+      dockerfile: Dockerfile.service
+      args: { SERVICE: payment }
+    environment:
+      <<: *service-env
+      PORT: 4007
+
+  notification:
+    <<: *service-common
+    build:
+      context: .
+      dockerfile: Dockerfile.service
+      args: { SERVICE: notification }
+    environment:
+      <<: *service-env
+      PORT: 4008
+
+  fulfilment:
+    <<: *service-common
+    build:
+      context: .
+      dockerfile: Dockerfile.service
+      args: { SERVICE: fulfilment }
+    environment:
+      <<: *service-env
+      PORT: 4009
+
+  gateway:
+    <<: *service-common
+    build:
+      context: .
+      dockerfile: Dockerfile.service
+      args: { SERVICE: gateway }
+    environment:
+      <<: *service-env
+      PORT: 8080
+    ports:
+      - "8080:8080"   # gateway (also Swagger at /api-docs)
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    depends_on:
+      - gateway
+    ports:
+      - "3000:80"     # web UI -> http://localhost:3000
+
+  prometheus:
+    image: prom/prometheus:latest
+    depends_on:
+      - gateway
+    volumes:
+      - ./infra/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./infra/alerts.yml:/etc/prometheus/alerts.yml:ro
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --web.enable-lifecycle
+    ports:
+      - "9090:9090"
+
+  grafana:
+    image: grafana/grafana:latest
+    depends_on:
+      - prometheus
+    environment:
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: admin
+    volumes:
+      - ./infra/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./infra/grafana/dashboards:/var/lib/grafana/dashboards:ro
+      - grafana-data:/var/lib/grafana
+    ports:
+      - "3001:3000"
+
+volumes:
+  mongo-data:
+  grafana-data:

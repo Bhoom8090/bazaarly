@@ -1,0 +1,15 @@
+# Generic service image. Build with: docker build --build-arg SERVICE=catalog -f Dockerfile.service .
+FROM node:20-alpine
+ARG SERVICE
+ENV SERVICE=${SERVICE}
+WORKDIR /app
+
+# Root package.json holds deps for ALL backend services (one install).
+COPY package.json package-lock.json* ./
+RUN npm install --omit=dev --no-audit --no-fund
+
+COPY shared ./shared
+COPY services ./services
+
+EXPOSE 4001 4002 4003 4004 4005 4006 4007 4008 4009 4010 8080
+CMD ["sh", "-c", "node services/${SERVICE}/index.js"]
