@@ -2,8 +2,6 @@
 
 **Bazaarly** is a single-merchant e-commerce web application for the Indian market — an Amazon-like storefront built on the **MERN** stack (MongoDB, Express, React, Node) with a microservices architecture.
 
-> Amazon-like **theme** only — not affiliated with Amazon. INR currency, sandbox payments, simulated carrier, single merchant. Demo project.
-
 ## What the site does
 
 - **Storefront** — hero + category tiles, catalogue browsing with pagination, full-text search with facets and price filters, product pages with live stock availability
