@@ -191,6 +191,8 @@ async function confirmOrder(orderId, correlationId) {
     logger.warn('reservation commit failed; sweeper will retry', { orderId, status: commitRes.status });
     return Order.findById(orderId);
   }
+  // Mark CONFIRMED + emit OrderConfirmed.v1 in ONE transaction, then clear the cart.
+  let justConfirmed = false;
   await withTxn(async (session) => {
     const order = await Order.findById(orderId).session(session);
     if (!order || order.state === 'CONFIRMED') return;
@@ -204,8 +206,18 @@ async function confirmOrder(orderId, correlationId) {
       eventType: 'OrderConfirmed.v1', producer: 'order', aggregateId: orderId, correlationId,
       payload: { orderId, customerId: order.customerId, total: order.pricing.total, currency: order.pricing.currency, items: order.items },
     });
+    justConfirmed = true;
   });
-  // Clear the user's cart (fire and forget; event also clears it)
+  // Clear the user's cart synchronously — but only on the actual transition,
+  // never on replayed confirm calls (would wipe a cart refilled afterwards).
+  if (justConfirmed) {
+    const confirmed = await Order.findById(orderId).lean();
+    if (confirmed?.customerId) {
+      callService(config.services.cart, `/internal/carts/${confirmed.customerId}`, { method: 'DELETE', timeoutMs: 3000, retries: 0 })
+        .then(() => logger.info('cart cleared for order', { orderId }))
+        .catch((e) => logger.warn('cart clear failed (event backstop remains)', { orderId, err: e.message }));
+    }
+  }
   return Order.findById(orderId);
 }
 
@@ -290,7 +302,7 @@ async function handleReservationExpired(envl) {
   });
   await consume('order.tracking', async (envl) => {
     const p = envl.payload || {};
-    const map = { IN_TRANSIT: 'FULFILLING', OUT_FOR_DELIVERY: 'FULFILLING', LABELLED: 'FULFILLING', DELIVERED: 'DELIVERED', CREATED: null };
+    const map = { LABELLED: 'FULFILLING', IN_TRANSIT: 'FULFILLING', OUT_FOR_DELIVERY: 'SHIPPED', DELIVERED: 'DELIVERED', CREATED: null };
     const target = map[p.status];
     if (!target) return;
     const order = await Order.findById(p.orderId);
