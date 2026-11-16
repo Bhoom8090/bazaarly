@@ -106,13 +106,26 @@ Common code used by every service: `config.js` (env), `logger.js` (JSON logs wit
 
 ## How to run (Docker Desktop)
 
-**Prerequisites:** [Docker Desktop](https://www.docker.com/products/docker-desktop/) installed and running (Windows/macOS/Linux), ~8 GB free RAM. Ports 3000, 8080, 9090, 3001, 8025, 15672, 1025 must be free.
+**Local PostgreSQL instead of Docker's:** this repo's `.env.example` supports both modes.
+- Default `.env.example` uses the bundled Docker PostgreSQL: `docker compose --profile docker-pg up --build`.
+- To use a **local PostgreSQL on your machine instead**, create the 8 databases once (as superuser):
+  ```sql
+  CREATE ROLE bazaarly LOGIN PASSWORD 'strong-password' NOSUPERUSER;
+  CREATE DATABASE bazaarly_identity OWNER bazaarly;  -- ...catalog search inventory orders payments notifications fulfilment
+  ```
+  then set in `.env`: `PGHOST=host.docker.internal  PGUSER=bazaarly  PGPASSWORD=<that password>`
+  and run `docker compose up --build` (no `--profile` needed; the Docker PG won't start).
+- App data then lives in **your** local PG. Query it directly (pgAdmin or `psql -h localhost -U bazaarly -d bazaarly_orders`).
 
 ```bash
 # 1. Clone the repo, then from the repo root:
 cp .env.example .env        # Windows cmd: copy .env.example .env
 
 # 2. Build and start everything (first run downloads images, ~5-10 min)
+#    Fresh clone / machine without local PG: include the bundled Docker PostgreSQL:
+docker compose --profile docker-pg up --build
+
+#    Machine WITH local PostgreSQL already set up (this repo's .env is preconfigured for that):
 docker compose up --build
 
 # 3. Open the app

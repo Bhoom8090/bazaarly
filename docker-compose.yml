@@ -5,19 +5,15 @@ x-service-common: &service-common
     context: .
     dockerfile: Dockerfile.service
   depends_on:
-    postgres:
-      condition: service_healthy
     redis:
       condition: service_started
     rabbitmq:
       condition: service_started
   environment: &service-env
     OTEL_EXPORTER_OTLP_ENDPOINT: http://jaeger:4318
-    POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-postgres}
-    POSTGRES_USER: ${POSTGRES_USER:-postgres}
-    PGHOST: postgres
-    PGPORT: 5432
-    PGUSER: ${PGUSER:-postgres}
+    PGHOST: ${PGHOST:-postgres}
+    PGPORT: ${PGPORT:-5432}
+    PGUSER: ${PGUSER:-bazaarly}
     PGPASSWORD: ${PGPASSWORD:-postgres}
     REDIS_URL: redis://redis:6379
     AMQP_URL: amqp://guest:guest@rabbitmq:5672
@@ -67,6 +63,7 @@ services:
       - "4318:4318"     # OTLP HTTP
 
   postgres:
+    profiles: ["docker-pg"]
     image: postgres:16-alpine
     environment:
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-postgres}
