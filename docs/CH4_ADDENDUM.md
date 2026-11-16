@@ -5,8 +5,8 @@ This addendum documents the state of the **implemented** platform as of the impl
 ## 4.1 Environment used for all measurements
 
 - Docker Desktop (Windows 11), WSL2 backend, single laptop
-- `docker compose up --build` (full stack: MongoDB 7 replica set `rs0`, Redis 7, RabbitMQ 3.13, Mailpit, Prometheus, Grafana, Jaeger all-in-one)
-- Node.js 22 services, one MongoDB database per service
+- `docker compose up --build` (full stack: PostgreSQL 16 (8 databases, one per transactional service), Redis 7, RabbitMQ 3.13, Mailpit, Prometheus, Grafana, Jaeger all-in-one)
+- Node.js 22 services, one PostgreSQL database per service
 
 ## 4.2 Validation plan results (V-01 .. V-12)
 
@@ -32,7 +32,7 @@ Measured environment caveats: single laptop, no resource limits tuned per servic
 
 | Area | Design stage | Implementation | Reason |
 |---|---|---|---|
-| Databases | PostgreSQL per transactional service (ADR-04) | MongoDB 7, one database per service, 1-node replica set | MERN stack requirement (project assignment) |
+| Databases | PostgreSQL per transactional service (ADR-04) | PostgreSQL 16, one database per service (8 DBs created by `infra/postgres-init.sql`), transactions via node-postgres `BEGIN`/`COMMIT`/`ROLLBACK` | **Matches report** |
 | Tracing | OpenTelemetry collector/pipeline | **Implemented** — OTel SDK in all 11 Node services exporting OTLP → Jaeger all-in-one; frontend spans not traced (browser) | Toolchain kept per assignment's "MERN + report stack" constraint; Jaeger UI on :16686 |
 | Correlation | x-correlation-id pattern | Also kept (x-correlation-id in HTTP + events + logs) | Belt and braces |
 | Outbox relay | at-least-once with duplicate delivery | Duplicates possible and observed (deduped by `processed_events`); notification consumer emits one email per *logical* event via dedupe key | Design acknowledges at-least-once |

@@ -5,15 +5,20 @@ x-service-common: &service-common
     context: .
     dockerfile: Dockerfile.service
   depends_on:
-    mongo-init:
-      condition: service_completed_successfully
+    postgres:
+      condition: service_healthy
     redis:
       condition: service_started
     rabbitmq:
       condition: service_started
   environment: &service-env
     OTEL_EXPORTER_OTLP_ENDPOINT: http://jaeger:4318
-    MONGO_URI: mongodb://mongo:27017/?replicaSet=rs0
+    POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-postgres}
+    POSTGRES_USER: ${POSTGRES_USER:-postgres}
+    PGHOST: postgres
+    PGPORT: 5432
+    PGUSER: ${PGUSER:-postgres}
+    PGPASSWORD: ${PGPASSWORD:-postgres}
     REDIS_URL: redis://redis:6379
     AMQP_URL: amqp://guest:guest@rabbitmq:5672
     SMTP_HOST: mailpit
@@ -61,28 +66,20 @@ services:
       - "4317:4317"     # OTLP gRPC
       - "4318:4318"     # OTLP HTTP
 
-  mongo:
-    image: mongo:7
-    command: ["mongod", "--replSet", "rs0", "--bind_ip_all"]
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-postgres}
+      POSTGRES_USER: ${POSTGRES_USER:-postgres}
+      POSTGRES_DB: postgres
+    volumes:
+      - ./infra/postgres-init.sql:/docker-entrypoint-initdb.d/00-init.sql:ro
+      - postgres-data:/var/lib/postgresql/data
     healthcheck:
-      test: ["CMD", "mongosh", "--quiet", "--eval", "db.adminCommand('ping').ok"]
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER:-postgres}"]
       interval: 5s
       timeout: 5s
       retries: 20
-    volumes:
-      - mongo-data:/data/db
-
-  mongo-init:
-    image: mongo:7
-    depends_on:
-      mongo:
-        condition: service_healthy
-    command: >
-      mongosh --host mongo:27017 --quiet --eval "
-        try { rs.status().ok && print('replica set already initialised'); }
-        catch (e) { rs.initiate({_id: 'rs0', members: [{_id: 0, host: 'mongo:27017'}]}); print('replica set initialised'); }
-      "
-
   redis:
     image: redis:7-alpine
     healthcheck:
@@ -270,5 +267,5 @@ services:
       - "3001:3000"
 
 volumes:
-  mongo-data:
+  postgres-data:
   grafana-data:

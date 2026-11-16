@@ -1,46 +1,58 @@
 'use strict';
-require('../../shared/telemetry');
 // Search service: read-optimised projection of the catalog, kept fresh via
 // ProductChanged.v1 events. Rebuildable from the catalog at any time.
+require('../../shared/telemetry');
 const { z } = require('zod');
 const config = require('../../shared/config');
 const logger = require('../../shared/logger');
 const { createApp, finish, listen, asyncH, validate, requireAdmin, HttpError } = require('../../shared/http');
-const { connectMongo, mongoose } = require('../../shared/db');
+const { connectDb, ensureEventTables } = require('../../shared/db');
 const { consume, amqpConnect } = require('../../shared/events');
 const { callService } = require('../../shared/clients');
 
 const app = createApp('search');
 const PORT = parseInt(process.env.PORT || '4003', 10);
 
-const docSchema = new mongoose.Schema({
-  _id: String, // productId
-  sku: { type: String, index: true },
-  title: String,
-  brand: String,
-  category: { type: String, index: true },
-  description: String,
-  price: Number,
-  emoji: String,
-  color: String,
-  status: String,
-  version: { type: Number, default: 0 },
-}, { collection: 'search_docs', versionKey: false, _id: false });
-docSchema.index({ title: 'text', description: 'text', brand: 'text', category: 'text' });
-const Doc = mongoose.model('SearchDoc', docSchema);
+const SCHEMA = `
+CREATE TABLE IF NOT EXISTS search_docs (
+  product_id   TEXT PRIMARY KEY,
+  sku          TEXT UNIQUE NOT NULL,
+  title        TEXT NOT NULL,
+  brand        TEXT NOT NULL,
+  category     TEXT NOT NULL,
+  description  TEXT NOT NULL DEFAULT '',
+  price        BIGINT NOT NULL,
+  emoji        TEXT,
+  color        TEXT,
+  status       TEXT NOT NULL DEFAULT 'active',
+  version      INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS search_docs_category_idx ON search_docs (category, status);
+CREATE INDEX IF NOT EXISTS search_docs_price_idx ON search_docs (status, price);
+CREATE INDEX IF NOT EXISTS search_docs_title_idx ON search_docs USING gin(to_tsvector('english', coalesce(title,'') || ' ' || coalesce(description,'') || ' ' || coalesce(brand,'')));
+`;
+
+let pool = null;
+
+const dtoRow = (r) => ({ productId: r.product_id, sku: r.sku, title: r.title, brand: r.brand, category: r.category, description: r.description, price: Number(r.price), emoji: r.emoji, color: r.color, status: r.status, version: r.version });
 
 async function applyProductChanged(p) {
-  // Version-guarded upsert: ignore stale events.
   if (!p || !p.productId) return;
-  const existing = await Doc.findById(p.productId).lean();
-  if (existing && (existing.version || 0) >= (p.version || 0)) return;
+  const cur = await pool.query('SELECT version FROM search_docs WHERE product_id = $1', [p.productId]);
+  if (cur.rows.length && (cur.rows[0].version || 0) >= (p.version || 0)) return;
   if (p.status === 'inactive') {
-    await Doc.deleteOne({ _id: p.productId });
+    await pool.query('DELETE FROM search_docs WHERE product_id = $1', [p.productId]);
     return;
   }
-  await Doc.findByIdAndUpdate(p.productId, {
-    $set: { sku: p.sku, title: p.title, brand: p.brand, category: p.category, description: p.description || '', price: p.price, emoji: p.emoji, color: p.color, status: p.status || 'active', version: p.version || 1 },
-  }, { upsert: true });
+  await pool.query(
+    `INSERT INTO search_docs (product_id, sku, title, brand, category, description, price, emoji, color, status, version)
+     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
+     ON CONFLICT (product_id) DO UPDATE SET
+       sku=EXCLUDED.sku, title=EXCLUDED.title, brand=EXCLUDED.brand, category=EXCLUDED.category,
+       description=EXCLUDED.description, price=EXCLUDED.price, emoji=EXCLUDED.emoji,
+       color=EXCLUDED.color, status=EXCLUDED.status, version=EXCLUDED.version`,
+    [p.productId, p.sku, p.title, p.brand, p.category, p.description || '', p.price, p.emoji, p.color, p.status || 'active', p.version || 1]
+  );
 }
 
 const searchSchema = z.object({
@@ -55,51 +67,106 @@ const searchSchema = z.object({
 
 app.get('/v1/search', asyncH(async (req, res) => {
   const { q, category, minPrice, maxPrice, sort, cursor, limit } = validate(searchSchema, req.query);
-  const filter = { status: 'active' };
-  if (category) filter.category = category;
-  if (minPrice != null) filter.price = { ...(filter.price || {}), $gte: minPrice };
-  if (maxPrice != null) filter.price = { ...(filter.price || {}), $lte: maxPrice };
+  const params = ['active'];
+  const where = ['status = $1'];
+  if (category) { params.push(category); where.push(`category = $${params.length}`); }
+  if (minPrice != null) { params.push(minPrice); where.push(`price >= $${params.length}`); }
+  if (maxPrice != null) { params.push(maxPrice); where.push(`price <= $${params.length}`); }
 
-  let usedText = false;
-  if (q && q.trim()) { filter.$text = { $search: q.trim() }; usedText = true; }
-
-  let sortSpec = sort === 'price_asc' ? { price: 1, _id: 1 } : sort === 'price_desc' ? { price: -1, _id: 1 } : usedText ? { score: { $meta: 'textScore' }, _id: 1 } : { _id: 1 };
-  let projection = usedText && sort === 'relevance' ? { score: { $meta: 'textScore' } } : {};
-
-  const runQuery = async (f) => {
-    let query = Doc.find(f, projection).sort(sortSpec);
-    if (cursor) query = query.where('_id').gt(cursor);
-    return query.limit(limit + 1).lean();
-  };
-
-  let docs = await runQuery(filter);
-  // Regex fallback when $text finds nothing — drop textScore sort/projection too
-  if (usedText && docs.length === 0 && q.trim()) {
-    delete filter.$text;
-    sortSpec = sort === 'price_asc' ? { price: 1, _id: 1 } : sort === 'price_desc' ? { price: -1, _id: 1 } : { _id: 1 };
-    projection = {};
-    const rx = new RegExp(q.trim().replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'i');
-    filter.$or = [{ title: rx }, { description: rx }, { brand: rx }, { sku: rx }];
-    docs = await runQuery(filter);
+  const trimmed = q.trim();
+  let useText = sort === 'relevance' && trimmed.length > 0;
+  if (useText) {
+    params.push(trimmed);
+    where.push(`to_tsvector('english', coalesce(title,'') || ' ' || coalesce(description,'') || ' ' || coalesce(brand,'')) @@ plainto_tsquery('english', $${params.length})`);
+  } else if (trimmed.length > 0) {
+    const rx = '%' + trimmed.replace(/[%_\\]/g, (m) => '\\' + m) + '%';
+    params.push(rx);
+    where.push(`(title ILIKE $${params.length} OR description ILIKE $${params.length} OR brand ILIKE $${params.length} OR sku ILIKE $${params.length})`);
   }
 
-  const total = await Doc.countDocuments(usedText && filter.$text ? filter : (() => { const f = { ...filter }; return f; })());
-  const facetAgg = await Doc.aggregate([{ $match: { status: 'active', ...(minPrice != null || maxPrice != null ? { price: filter.price } : {}) } }, { $group: { _id: '$category', count: { $sum: 1 } } }]);
-  const hasMore = docs.length > limit;
-  const items = docs.slice(0, limit).map((d) => ({ productId: d._id, sku: d.sku, title: d.title, brand: d.brand, category: d.category, price: d.price, emoji: d.emoji, color: d.color }));
+  // Sort + cursor: stable pagination by product_id whenever a cursor is present.
+  let orderBy = 'product_id';
+  if (!cursor) {
+    if (sort === 'price_asc') orderBy = 'price ASC, product_id ASC';
+    else if (sort === 'price_desc') orderBy = 'price DESC, product_id ASC';
+    else if (useText) orderBy = `ts_rank(to_tsvector('english', coalesce(title,'') || ' ' || coalesce(description,'') || ' ' || coalesce(brand,'')), plainto_tsquery('english', $${params.length})) DESC, product_id ASC`;
+  }
+
+  const whereSql = where.length ? 'WHERE ' + where.join(' AND ') : '';
+  if (cursor) { params.push(cursor); }
+  params.push(limit + 1);
+  const r = await pool.query(`SELECT * FROM search_docs ${whereSql}${cursor ? ' AND product_id > $' + (params.length - 1) : ''} ORDER BY ${orderBy} LIMIT $${params.length}`, params);
+  let rows = r.rows;
+
+  // Partial/typo words: $text matched nothing -> ILIKE substring search
+  if (useText && rows.length === 0 && trimmed.length > 0) {
+    useText = false;
+    const fbParams = ['active'];
+    const fbWhere = ['status = $1'];
+    if (category) { fbParams.push(category); fbWhere.push(`category = $${fbParams.length}`); }
+    if (minPrice != null) { fbParams.push(minPrice); fbWhere.push(`price >= $${fbParams.length}`); }
+    if (maxPrice != null) { fbParams.push(maxPrice); fbWhere.push(`price <= $${fbParams.length}`); }
+    fbParams.push('%' + trimmed.replace(/[%_\\]/g, (m) => '\\' + m) + '%');
+    fbWhere.push(`(title ILIKE $${fbParams.length} OR description ILIKE $${fbParams.length} OR brand ILIKE $${fbParams.length} OR sku ILIKE $${fbParams.length})`);
+    if (cursor) { fbParams.push(cursor); fbWhere.push(`product_id > $${fbParams.length}`); }
+    fbParams.push(limit + 1);
+    const fr = await pool.query(`SELECT * FROM search_docs WHERE ${fbWhere.join(' AND ')} ORDER BY product_id LIMIT $${fbParams.length}`, fbParams);
+    rows = fr.rows;
+    // Rebuild total to ILIKE semantics
+    const totalParams = ['active'];
+    const totalWhere = ['status = $1'];
+    if (category) { totalParams.push(category); totalWhere.push(`category = $${totalParams.length}`); }
+    if (minPrice != null) { totalParams.push(minPrice); totalWhere.push(`price >= $${totalParams.length}`); }
+    if (maxPrice != null) { totalParams.push(maxPrice); totalWhere.push(`price <= $${totalParams.length}`); }
+    totalParams.push('%' + trimmed.replace(/[%_\\]/g, (m) => '\\' + m) + '%');
+    totalWhere.push(`(title ILIKE $${totalParams.length} OR description ILIKE $${totalParams.length} OR brand ILIKE $${totalParams.length} OR sku ILIKE $${totalParams.length})`);
+    const tr = await pool.query(`SELECT count(*)::int AS c FROM search_docs WHERE ${totalWhere.join(' AND ')}`, totalParams);
+    const facetParams = ['active'];
+    const facetWhere = ['status = $1'];
+    if (minPrice != null) { facetParams.push(minPrice); facetWhere.push(`price >= $${facetParams.length}`); }
+    if (maxPrice != null) { facetParams.push(maxPrice); facetWhere.push(`price <= $${facetParams.length}`); }
+    const facetsRes = await pool.query(`SELECT category AS name, count(*)::int AS count FROM search_docs WHERE ${facetWhere.join(' AND ')} GROUP BY category`, facetParams);
+    const hasMore = rows.length > limit;
+    const items = rows.slice(0, limit).map(dtoRow);
+    return res.json({ items, total: tr.rows[0].c, facets: { categories: facetsRes.rows.map((f) => ({ name: f.name, count: f.count })) }, nextCursor: hasMore ? items[items.length - 1].productId : null, query: trimmed });
+  }
+
+  // Total + facet counts (no WHERE for text to keep facets useful)
+  const facetWhere = ['status = $1'];
+  const facetParams = ['active'];
+  if (minPrice != null) { facetParams.push(minPrice); facetWhere.push(`price >= $${facetParams.length}`); }
+  if (maxPrice != null) { facetParams.push(maxPrice); facetWhere.push(`price <= $${facetParams.length}`); }
+  const facetsRes = await pool.query(`SELECT category AS name, count(*)::int AS count FROM search_docs WHERE ${facetWhere.join(' AND ')} GROUP BY category`, facetParams);
+
+  let totalFilter = ['status = $1'];
+  const totalParams = ['active'];
+  if (category) { totalParams.push(category); totalFilter.push(`category = $${totalParams.length}`); }
+  if (minPrice != null) { totalParams.push(minPrice); totalFilter.push(`price >= $${totalParams.length}`); }
+  if (maxPrice != null) { totalParams.push(maxPrice); totalFilter.push(`price <= $${totalParams.length}`); }
+  if (useText) {
+    totalParams.push(trimmed);
+    totalFilter.push(`to_tsvector('english', coalesce(title,'') || ' ' || coalesce(description,'') || ' ' || coalesce(brand,'')) @@ plainto_tsquery('english', $${totalParams.length})`);
+  } else if (trimmed.length > 0) {
+    totalParams.push('%' + trimmed.replace(/[%_\\]/g, (m) => '\\' + m) + '%');
+    totalFilter.push(`(title ILIKE $${totalParams.length} OR description ILIKE $${totalParams.length} OR brand ILIKE $${totalParams.length} OR sku ILIKE $${totalParams.length})`);
+  }
+  const totalRes = await pool.query(`SELECT count(*)::int AS c FROM search_docs WHERE ${totalFilter.join(' AND ')}`, totalParams);
+
+  const hasMore = rows.length > limit;
+  const items = rows.slice(0, limit).map(dtoRow);
   res.json({
     items,
-    total,
-    facets: { categories: facetAgg.map((f) => ({ name: f._id, count: f.count })) },
+    total: totalRes.rows[0].c,
+    facets: { categories: facetsRes.rows.map((f) => ({ name: f.name, count: f.count })) },
     nextCursor: hasMore ? items[items.length - 1].productId : null,
-    query: q.trim(),
+    query: trimmed,
   });
 }));
 
 // Admin: rebuild projection from catalog
 async function reindex() {
   logger.info('search reindex started');
-  await Doc.deleteMany({});
+  await pool.query('DELETE FROM search_docs');
   let cursor = null;
   let total = 0;
   do {
@@ -122,9 +189,11 @@ app.post('/v1/admin/search/reindex', requireAdmin, asyncH(async (_req, res) => {
 }));
 
 (async () => {
-  await connectMongo('search');
+  pool = await connectDb('bazaarly_search');
+  await pool.query(SCHEMA);
+  await ensureEventTables(pool);
   await amqpConnect().catch(() => {});
-  await consume('search.product-changed', async (envl) => { await applyProductChanged(envl.payload); });
+  await consume('search.product-changed', async (envl) => { await applyProductChanged(envl.payload); }, pool);
   // Rebuildable read model: reindex from catalog on boot (best effort).
   reindex().catch((e) => logger.warn('boot reindex failed (will rely on events)', { err: e.message }));
   finish(app);

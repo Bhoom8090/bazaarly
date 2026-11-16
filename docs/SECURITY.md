@@ -19,7 +19,7 @@ This document summarises the security controls implemented in the platform, mapp
 ## Injection / XSS / CSRF
 
 - All service input validated with zod schemas (bounded lengths, formats for email/phone/pincode).
-- Parameterized data access via Mongoose (no string-concatenated queries).
+- Parameterized data access via `pg` (`$1, $2` placeholders, never string-concatenated values).
 - React escapes output; no `dangerouslySetInnerHTML`.
 - CSRF: cookie-authenticated mutating requests must echo `X-CSRF-Token` equal to the token's `csrf` claim (double-submit). Mismatch → 403. Bearer-authenticated (non-cookie) requests are exempt.
 - Security headers on nginx (CSP with `script-src 'self'`, frame-ancestors 'self', X-Frame-Options SAMEORIGIN, nosniff, Referrer-Policy, Permissions-Policy disabling camera/mic/geo).

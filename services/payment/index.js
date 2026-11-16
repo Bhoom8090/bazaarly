@@ -1,59 +1,59 @@
 'use strict';
-require('../../shared/telemetry');
-// Payment service: attempts (unique per order), provider adapter to the mock PSP,
-// signed webhooks with dedupe, reconciler for stale attempts, capture/void driven by order events.
+// Payment service: attempts (unique per order), provider adapter to mock PSP,
+// signed webhooks with dedupe, reconciler for stale attempts, capture/void on order events.
 // NO PAN/CVV is ever stored or logged.
+require('../../shared/telemetry');
 const { z } = require('zod');
 const crypto = require('crypto');
 const config = require('../../shared/config');
 const logger = require('../../shared/logger');
 const { createApp, finish, listen, asyncH, validate, HttpError } = require('../../shared/http');
-const { connectMongo, mongoose, withTxn } = require('../../shared/db');
+const { connectDb, withTxn, ensureEventTables } = require('../../shared/db');
 const { addOutbox, consume, startOutboxRelay, amqpConnect } = require('../../shared/events');
 const { callService } = require('../../shared/clients');
 const { verify } = require('../../shared/webhook');
 
-const webhookPaths = ['/v1/webhooks/payments/'];
-const app = createApp('payment', { rawPaths: webhookPaths });
+const app = createApp('payment', { rawPaths: ['/v1/webhooks/payments/'] });
 const PORT = parseInt(process.env.PORT || '4007', 10);
 
-const attemptSchema = new mongoose.Schema({
-  _id: String,              // uuid
-  orderId: { type: String, unique: true, index: true },
-  idemKey: { type: String, index: true },          // "order-<orderId>"
-  provider: { type: String, default: 'mockpsp' },
-  providerRef: String,      // PSP payment intent id
-  status: { type: String, enum: ['CREATED', 'PROCESSING', 'AUTHORIZED', 'CAPTURED', 'FAILED', 'VOIDED'], default: 'CREATED', index: true },
-  amount: Number,
-  currency: { type: String, default: 'INR' },
-  scenario: String,
-  customerId: String,
-  authorizedAt: Date,
-  failureCode: String,
-  createdAt: { type: Date, default: Date.now },
-  updatedAt: { type: Date, default: Date.now },
-}, { collection: 'payment_attempts', versionKey: false, _id: false });
-const webhookEventSchema = new mongoose.Schema({
-  _id: String,              // provider event id
-  provider: String,
-  type: String,
-  payload: Object,
-  receivedAt: { type: Date, default: Date.now },
-  processed: { type: Boolean, default: false },
-}, { collection: 'webhook_events', versionKey: false, _id: false });
-const Attempt = mongoose.model('PaymentAttempt', attemptSchema);
-const WebhookEvent = mongoose.model('PaymentWebhookEvent', webhookEventSchema);
+const SCHEMA = `
+CREATE TABLE IF NOT EXISTS payment_attempts (
+  id              TEXT PRIMARY KEY,
+  order_id        TEXT UNIQUE NOT NULL,
+  idem_key        TEXT NOT NULL,
+  provider        TEXT NOT NULL DEFAULT 'mockpsp',
+  provider_ref    TEXT,
+  status          TEXT NOT NULL DEFAULT 'CREATED',
+  amount          BIGINT NOT NULL,
+  currency        TEXT NOT NULL DEFAULT 'INR',
+  scenario        TEXT,
+  customer_id     TEXT,
+  authorized_at   TIMESTAMPTZ,
+  failure_code    TEXT,
+  created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
+  updated_at      TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS attempts_status_idx ON payment_attempts (status, updated_at);
+CREATE TABLE IF NOT EXISTS webhook_events (
+  event_id     TEXT PRIMARY KEY,
+  provider     TEXT NOT NULL,
+  type         TEXT,
+  payload      JSONB NOT NULL,
+  received_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
+  processed    BOOLEAN NOT NULL DEFAULT false
+);
+`;
 
+let pool = null;
+const TERMINAL = ['CAPTURED', 'FAILED', 'VOIDED'];
 const TRANSITIONS = {
   CREATED: ['PROCESSING', 'AUTHORIZED', 'FAILED', 'VOIDED'],
   PROCESSING: ['AUTHORIZED', 'FAILED', 'VOIDED'],
   AUTHORIZED: ['CAPTURED', 'VOIDED'],
   CAPTURED: [], FAILED: [], VOIDED: [],
 };
-const TERMINAL = ['CAPTURED', 'FAILED', 'VOIDED'];
-
-function transitionGuard(from, to) {
-  if (TERMINAL.includes(from)) return from === to; // terminal wins; no-op
+function canTransitionPayment(from, to) {
+  if (TERMINAL.includes(from)) return from === to;
   return (TRANSITIONS[from] || []).includes(to);
 }
 
@@ -64,21 +64,26 @@ async function pspCall(path, { method = 'GET', body, idemKey, timeoutMs = 3000 }
   });
 }
 
-async function emitPaymentEvent(session, type, attempt, correlationId) {
-  await addOutbox(session, {
-    eventType: type, producer: 'payment', aggregateId: attempt.orderId, correlationId,
-    payload: { orderId: attempt.orderId, customerId: attempt.customerId || null, amount: attempt.amount, currency: attempt.currency, provider: attempt.provider, providerRef: attempt.providerRef, failureCode: attempt.failureCode || null },
+async function emitPaymentEvent(client, type, attempt, correlationId) {
+  await addOutbox(client, {
+    eventType: type, producer: 'payment', aggregateId: attempt.order_id, correlationId,
+    payload: { orderId: attempt.order_id, customerId: attempt.customer_id || null, amount: Number(attempt.amount), currency: attempt.currency, provider: attempt.provider, providerRef: attempt.provider_ref, failureCode: attempt.failure_code || null },
   });
 }
 
-// Transition attempt with guarded update. Only matches rows NOT already in the target
-// state, so re-entered transitions (duplicate webhooks, reconciler races) are no-ops
-// and never double-emit events. Returns the updated doc, or null.
-async function transitionAttempt(id, fromStates, to, extra = {}, session) {
-  const q = { _id: id, status: { $in: fromStates, $ne: to } };
-  const update = { $set: { status: to, updatedAt: new Date(), ...extra } };
-  if (session) return Attempt.findOneAndUpdate(q, update, { new: true, session });
-  return Attempt.findOneAndUpdate(q, update, { new: true });
+// Guarded transition: no-ops if already in target state (prevents duplicate event emission).
+async function transitionAttempt(id, fromStates, to, extra = {}, client) {
+  const sets = ['status = $1', 'updated_at = now()'];
+  const params = [to];
+  let p = 2;
+  for (const [k, v] of Object.entries(extra)) {
+    sets.push(`${k} = $${p++}`);
+    params.push(v);
+  }
+  params.push(id, fromStates, to);
+  const sql = `UPDATE payment_attempts SET ${sets.join(', ')} WHERE id = $${p} AND status = ANY($${p + 1}::text[]) AND status <> $${p + 2} RETURNING *`;
+  const r = await (client || pool).query(sql, params);
+  return r.rowCount ? r.rows[0] : null;
 }
 
 const authorizeSchema = z.object({
@@ -89,81 +94,81 @@ const authorizeSchema = z.object({
   customerId: z.string().optional(),
 });
 
+const attemptDto = (a) => a ? { ...a, amount: Number(a.amount) } : a;
+
 // POST /internal/payments/authorize
 app.post('/internal/payments/authorize', asyncH(async (req, res) => {
   const { orderId, amount, currency, scenario, customerId } = validate(authorizeSchema, req.body);
   const idemKey = `order-${orderId}`;
 
-  let attempt = await Attempt.findOne({ orderId });
+  let attempt = (await pool.query('SELECT * FROM payment_attempts WHERE order_id = $1', [orderId])).rows[0];
   if (attempt && TERMINAL.includes(attempt.status)) {
-    return res.status(200).json({ status: attempt.status, attempt, replayed: true });
+    return res.status(200).json({ status: attempt.status, attempt: attemptDto(attempt), replayed: true });
   }
   if (!attempt) {
-    attempt = await Attempt.create({ _id: crypto.randomUUID(), orderId, idemKey, amount, currency, scenario, status: 'CREATED', customerId });
+    const ins = await pool.query(
+      `INSERT INTO payment_attempts (id, order_id, idem_key, amount, currency, scenario, customer_id, status)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,'CREATED') RETURNING *`,
+      [crypto.randomUUID(), orderId, idemKey, amount, currency, scenario, customerId]);
+    attempt = ins.rows[0];
   }
 
-  await transitionAttempt(attempt._id, ['CREATED', 'PROCESSING'], 'PROCESSING');
+  await transitionAttempt(attempt.id, ['CREATED', 'PROCESSING'], 'PROCESSING');
 
-  // Call mock PSP with stable idempotency key
-  // 3s hard timeout so the "timeout" scenario (intent authorizes at the PSP but the
-  // response is delayed 8s) falls back to the reconciler instead of blocking checkout.
-  const pspRes = await pspCall('/psp/v1/payment_intents', { method: 'POST', body: { amount, currency, scenario, metadata: { orderId } }, idemKey, timeoutMs: 3000 });
+  const pspRes = await pspCall('/psp/v1/payment_intents', {
+    method: 'POST', body: { amount, currency, scenario, metadata: { orderId } }, idemKey, timeoutMs: 3000,
+  });
 
   if (!pspRes.ok && pspRes.status !== 200) {
-    // PSP unreachable or error: keep PROCESSING; reconciler will resolve.
-    const cur = await Attempt.findById(attempt._id);
-    return res.status(202).json({ status: cur.status, attempt: cur, pending: true });
+    const cur = await pool.query('SELECT * FROM payment_attempts WHERE id = $1', [attempt.id]);
+    return res.status(202).json({ status: cur.rows[0].status, attempt: attemptDto(cur.rows[0]), pending: true });
   }
   const intent = pspRes.data;
-  const providerRef = intent.id;
-  await Attempt.updateOne({ _id: attempt._id }, { $set: { providerRef, updatedAt: new Date() } });
+  await pool.query('UPDATE payment_attempts SET provider_ref = $1, updated_at = now() WHERE id = $2', [intent.id, attempt.id]);
 
   if (intent.status === 'authorized') {
-    // Synchronous authorization (success / timeout-delayed)
-    const result = await withTxn(async (session) => {
-      const a = await transitionAttempt(attempt._id, ['CREATED', 'PROCESSING', 'AUTHORIZED'], 'AUTHORIZED', { authorizedAt: new Date(), providerRef }, session);
-      if (a) await emitPaymentEvent(session, 'PaymentAuthorized.v1', a, req.correlationId);
+    const r = await withTxn(pool, async (client) => {
+      const a = await transitionAttempt(attempt.id, ['CREATED', 'PROCESSING', 'AUTHORIZED'], 'AUTHORIZED', { authorized_at: new Date(), provider_ref: intent.id }, client);
+      if (a) await emitPaymentEvent(client, 'PaymentAuthorized.v1', a, req.correlationId);
       return a;
     });
-    const a = result.result || (await Attempt.findById(attempt._id));
-    return res.status(200).json({ status: a.status, attempt: a });
+    const a = r.result || (await pool.query('SELECT * FROM payment_attempts WHERE id = $1', [attempt.id])).rows[0];
+    return res.status(200).json({ status: a.status, attempt: attemptDto(a) });
   }
   if (intent.status === 'failed') {
-    const result = await withTxn(async (session) => {
-      const a = await transitionAttempt(attempt._id, ['CREATED', 'PROCESSING', 'FAILED'], 'FAILED', { failureCode: intent.failure_code || 'card_declined', providerRef }, session);
-      if (a) await emitPaymentEvent(session, 'PaymentFailed.v1', a, req.correlationId);
+    const r = await withTxn(pool, async (client) => {
+      const a = await transitionAttempt(attempt.id, ['CREATED', 'PROCESSING', 'FAILED'], 'FAILED', { failure_code: intent.failure_code || 'card_declined', provider_ref: intent.id }, client);
+      if (a) await emitPaymentEvent(client, 'PaymentFailed.v1', a, req.correlationId);
       return a;
     });
-    const a = result.result || (await Attempt.findById(attempt._id));
-    return res.status(200).json({ status: a.status, attempt: a });
+    const a = r.result || (await pool.query('SELECT * FROM payment_attempts WHERE id = $1', [attempt.id])).rows[0];
+    return res.status(200).json({ status: a.status, attempt: attemptDto(a) });
   }
-  // async / processing
-  return res.status(202).json({ status: 'PROCESSING', attempt: { ...attempt.toObject(), providerRef }, pending: true });
+  return res.status(202).json({ status: 'PROCESSING', attempt: { ...attemptDto(attempt), provider_ref: intent.id }, pending: true });
 }));
 
-// POST /internal/payments/void
 const voidSchema = z.object({ orderId: z.string().min(4) });
 app.post('/internal/payments/void', asyncH(async (req, res) => {
   const { orderId } = validate(voidSchema, req.body);
-  const attempt = await Attempt.findOne({ orderId });
+  const attempt = (await pool.query('SELECT * FROM payment_attempts WHERE order_id = $1', [orderId])).rows[0];
   if (!attempt) return res.json({ orderId, status: 'NOT_FOUND', voided: false });
   if (attempt.status === 'VOIDED') return res.json({ orderId, status: 'VOIDED', voided: true, replayed: true });
   if (attempt.status === 'CAPTURED') throw new HttpError(409, 'ALREADY_CAPTURED', 'Payment already captured');
-  if (attempt.providerRef) {
-    await pspCall(`/psp/v1/payment_intents/${attempt.providerRef}/cancel`, { method: 'POST', body: {}, timeoutMs: 3000 }).catch(() => {});
+  if (attempt.provider_ref) {
+    await pspCall(`/psp/v1/payment_intents/${attempt.provider_ref}/cancel`, { method: 'POST', body: {}, timeoutMs: 3000 }).catch(() => {});
   }
-  const a = await transitionAttempt(attempt._id, ['CREATED', 'PROCESSING', 'AUTHORIZED', 'FAILED'], 'VOIDED', {});
+  const a = await transitionAttempt(attempt.id, ['CREATED', 'PROCESSING', 'AUTHORIZED', 'FAILED'], 'VOIDED');
   res.json({ orderId, status: a ? 'VOIDED' : attempt.status, voided: !!a });
 }));
 
 // Capture on OrderConfirmed.v1
-async function captureForOrder(orderId, correlationId) {
-  const attempt = await Attempt.findOne({ orderId });
+async function captureForOrder(orderId) {
+  const attempt = (await pool.query('SELECT * FROM payment_attempts WHERE order_id = $1', [orderId])).rows[0];
   if (!attempt || attempt.status !== 'AUTHORIZED') return;
-  if (attempt.providerRef) {
-    await pspCall(`/psp/v1/payment_intents/${attempt.providerRef}/capture`, { method: 'POST', body: {}, timeoutMs: 3000 }).catch(() => {});
+  if (attempt.provider_ref) {
+    await pspCall(`/psp/v1/payment_intents/${attempt.provider_ref}/capture`, { method: 'POST', body: {}, timeoutMs: 3000 }).catch(() => {});
   }
-  await transitionAttempt(attempt._id, ['AUTHORIZED'], 'CAPTURED');
+  await transitionAttempt(attempt.id, ['AUTHORIZED'], 'CAPTURED');
 }
 
 // ---- Webhook endpoint (public, signature-verified, raw body) ------------------
@@ -179,67 +184,63 @@ app.post('/v1/webhooks/payments/:provider', asyncH(async (req, res) => {
   const eventId = event.event_id || event.id;
   if (!eventId) throw new HttpError(400, 'BAD_EVENT', 'Missing event id');
 
-  // Dedupe
-  const existing = await WebhookEvent.findById(eventId);
-  if (existing) return res.json({ received: true, duplicate: true });
-  await WebhookEvent.create({ _id: eventId, provider, type: event.type, payload: event, processed: false });
+  const existing = await pool.query('SELECT 1 FROM webhook_events WHERE event_id = $1', [eventId]);
+  if (existing.rowCount) return res.json({ received: true, duplicate: true });
+  await pool.query('INSERT INTO webhook_events (event_id, provider, type, payload) VALUES ($1,$2,$3,$4)', [eventId, provider, event.type, raw.toString()]);
 
   const intent = event.data && event.data.object;
   const orderId = intent && intent.metadata && intent.metadata.orderId;
   const type = event.type;
 
   if (intent && intent.id) {
-    const attempt = await Attempt.findOne({ providerRef: intent.id }) || (orderId ? await Attempt.findOne({ orderId }) : null);
-    // Stale/out-of-order events are ignored via guarded transitions; authorized-after-void -> cancel at PSP.
+    let attempt = (await pool.query('SELECT * FROM payment_attempts WHERE provider_ref = $1', [intent.id])).rows[0];
+    if (!attempt && orderId) attempt = (await pool.query('SELECT * FROM payment_attempts WHERE order_id = $1', [orderId])).rows[0];
     if (attempt) {
       if (type === 'payment_intent.authorized') {
         if (attempt.status === 'VOIDED') {
-          // Late authorization on a dead order: cancel at the PSP.
           await pspCall(`/psp/v1/payment_intents/${intent.id}/cancel`, { method: 'POST', body: {}, timeoutMs: 3000 }).catch(() => {});
         } else {
-          await withTxn(async (session) => {
-            const a = await transitionAttempt(attempt._id, ['CREATED', 'PROCESSING', 'AUTHORIZED'], 'AUTHORIZED', { authorizedAt: new Date(), providerRef: intent.id }, session);
-            if (a) await emitPaymentEvent(session, 'PaymentAuthorized.v1', a, req.correlationId);
+          await withTxn(pool, async (client) => {
+            const a = await transitionAttempt(attempt.id, ['CREATED', 'PROCESSING', 'AUTHORIZED'], 'AUTHORIZED', { authorized_at: new Date(), provider_ref: intent.id }, client);
+            if (a) await emitPaymentEvent(client, 'PaymentAuthorized.v1', a, req.correlationId);
           });
         }
       } else if (type === 'payment_intent.failed') {
-        await withTxn(async (session) => {
-          const a = await transitionAttempt(attempt._id, ['CREATED', 'PROCESSING', 'FAILED'], 'FAILED', { failureCode: (intent.failure_code) || 'card_declined', providerRef: intent.id }, session);
-          if (a) await emitPaymentEvent(session, 'PaymentFailed.v1', a, req.correlationId);
+        await withTxn(pool, async (client) => {
+          const a = await transitionAttempt(attempt.id, ['CREATED', 'PROCESSING', 'FAILED'], 'FAILED', { failure_code: intent.failure_code || 'card_declined', provider_ref: intent.id }, client);
+          if (a) await emitPaymentEvent(client, 'PaymentFailed.v1', a, req.correlationId);
         });
       }
     } else if (orderId) {
-      // PSP may not have an attempt row yet in edge races; reconciler handles.
       logger.warn('webhook for unknown attempt', { orderId, intentId: intent.id });
     }
   }
-  await WebhookEvent.updateOne({ _id: eventId }, { $set: { processed: true } });
+  await pool.query('UPDATE webhook_events SET processed = true WHERE event_id = $1', [eventId]);
   res.json({ received: true });
 }));
 
 // Reconciler: every 10s, find stale CREATED/PROCESSING attempts and query the PSP
 setInterval(async () => {
   try {
-    const stale = await Attempt.find({ status: { $in: ['CREATED', 'PROCESSING'] }, updatedAt: { $lt: new Date(Date.now() - 5000) } }).limit(20);
-    for (const attempt of stale) {
-      const pspRes = await pspCall(`/psp/v1/payment_intents?idempotency_key=${encodeURIComponent(attempt.idemKey)}`, { timeoutMs: 3000 });
+    const stale = await pool.query("SELECT * FROM payment_attempts WHERE status IN ('CREATED','PROCESSING') AND updated_at < now() - interval '5 seconds' LIMIT 20");
+    for (const attempt of stale.rows) {
+      const pspRes = await pspCall(`/psp/v1/payment_intents?idempotency_key=${encodeURIComponent(attempt.idem_key)}`, { timeoutMs: 3000 });
       if (pspRes.status === 404) {
-        // PSP never saw it: re-post with same key
-        await pspCall('/psp/v1/payment_intents', { method: 'POST', body: { amount: attempt.amount, currency: attempt.currency, scenario: attempt.scenario || 'success', metadata: { orderId: attempt.orderId } }, idemKey: attempt.idemKey, timeoutMs: 3000 });
+        await pspCall('/psp/v1/payment_intents', { method: 'POST', body: { amount: Number(attempt.amount), currency: attempt.currency, scenario: attempt.scenario || 'success', metadata: { orderId: attempt.order_id } }, idemKey: attempt.idem_key, timeoutMs: 3000 });
         continue;
       }
       if (!pspRes.ok) continue;
       const intent = pspRes.data;
-      await Attempt.updateOne({ _id: attempt._id }, { $set: { providerRef: intent.id, updatedAt: new Date() } });
-      if (intent.status === 'authorized' && transitionGuard(attempt.status, 'AUTHORIZED')) {
-        await withTxn(async (session) => {
-          const a = await transitionAttempt(attempt._id, ['CREATED', 'PROCESSING'], 'AUTHORIZED', { authorizedAt: new Date(), providerRef: intent.id }, session);
-          if (a) await emitPaymentEvent(session, 'PaymentAuthorized.v1', a);
+      await pool.query('UPDATE payment_attempts SET provider_ref = $1, updated_at = now() WHERE id = $2', [intent.id, attempt.id]);
+      if (intent.status === 'authorized') {
+        await withTxn(pool, async (client) => {
+          const a = await transitionAttempt(attempt.id, ['CREATED', 'PROCESSING'], 'AUTHORIZED', { authorized_at: new Date(), provider_ref: intent.id }, client);
+          if (a) await emitPaymentEvent(client, 'PaymentAuthorized.v1', a);
         });
-      } else if (intent.status === 'failed' && transitionGuard(attempt.status, 'FAILED')) {
-        await withTxn(async (session) => {
-          const a = await transitionAttempt(attempt._id, ['CREATED', 'PROCESSING'], 'FAILED', { failureCode: intent.failure_code || 'card_declined', providerRef: intent.id }, session);
-          if (a) await emitPaymentEvent(session, 'PaymentFailed.v1', a);
+      } else if (intent.status === 'failed') {
+        await withTxn(pool, async (client) => {
+          const a = await transitionAttempt(attempt.id, ['CREATED', 'PROCESSING'], 'FAILED', { failure_code: intent.failure_code || 'card_declined', provider_ref: intent.id }, client);
+          if (a) await emitPaymentEvent(client, 'PaymentFailed.v1', a);
         });
       }
     }
@@ -249,18 +250,20 @@ setInterval(async () => {
 }, 10000).unref();
 
 (async () => {
-  await connectMongo('payments');
+  pool = await connectDb('bazaarly_payments');
+  await pool.query(SCHEMA);
+  await ensureEventTables(pool);
   await amqpConnect().catch(() => {});
-  startOutboxRelay('payment');
-  await consume('payment.order-confirmed', async (envl) => { await captureForOrder((envl.payload || {}).orderId); });
+  startOutboxRelay('payment', pool);
+  await consume('payment.order-confirmed', async (envl) => { await captureForOrder((envl.payload || {}).orderId); }, pool);
   await consume('payment.order-cancelled', async (envl) => {
     const orderId = (envl.payload || {}).orderId;
     if (!orderId) return;
-    const attempt = await Attempt.findOne({ orderId });
+    const attempt = (await pool.query('SELECT * FROM payment_attempts WHERE order_id = $1', [orderId])).rows[0];
     if (!attempt || ['VOIDED', 'CAPTURED'].includes(attempt.status)) return;
-    if (attempt.providerRef) await pspCall(`/psp/v1/payment_intents/${attempt.providerRef}/cancel`, { method: 'POST', body: {}, timeoutMs: 3000 }).catch(() => {});
-    await transitionAttempt(attempt._id, ['CREATED', 'PROCESSING', 'AUTHORIZED', 'FAILED'], 'VOIDED');
-  });
+    if (attempt.provider_ref) await pspCall(`/psp/v1/payment_intents/${attempt.provider_ref}/cancel`, { method: 'POST', body: {}, timeoutMs: 3000 }).catch(() => {});
+    await transitionAttempt(attempt.id, ['CREATED', 'PROCESSING', 'AUTHORIZED', 'FAILED'], 'VOIDED');
+  }, pool);
   finish(app);
   listen(app, PORT, 'payment');
 })().catch((err) => { logger.error('payment failed to start', { err: err.message }); process.exit(1); });

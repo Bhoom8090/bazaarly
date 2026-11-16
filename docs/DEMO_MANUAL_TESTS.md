@@ -63,17 +63,16 @@ node tests/acceptance/run.js   # ensure baseline is green
 **Procedure**
 
 ```bash
-# Backup (writes ./backups/<timestamp>/<db>.archive, ~a few MB)
-sh scripts/backup-restore.sh backup
+# Backup (writes ./backups/<timestamp>/<db>.dump, ~a few MB)
+MSYS_NO_PATHCONV=1 sh scripts/backup-restore.sh backup
 
 # Simulate loss + restore
-docker compose restart mongo
-sh scripts/backup-restore.sh restore ./backups/<timestamp>
+docker compose restart postgres
+MSYS_NO_PATHCONV=1 sh scripts/backup-restore.sh restore ./backups/<timestamp>
 
 # Verify counts
-docker exec bazaarly-mongo-1 mongosh --quiet --eval '
-  print("products:", db.getSiblingDB("catalog").products.countDocuments());
-  print("orders:",   db.getSiblingDB("orders").orders.countDocuments());'
+docker exec bazaarly-postgres-1 psql -U postgres -d bazaarly_catalog -c "SELECT count(*) FROM products;"
+docker exec bazaarly-postgres-1 psql -U postgres -d bazaarly_orders -c "SELECT count(*) FROM orders;"
 ```
 
 **Observed behaviour (verified):** backup of 8 databases (identity, catalog, search, inventory, orders, payments, notifications, fulfilment) succeeded; restore completed in ~1 s with 0 failed documents; product and order counts identical pre/post restore; services required restart to re-sync outbox relay / Redis caches (`docker compose restart` is printed at the end of restore).

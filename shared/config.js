@@ -26,7 +26,12 @@ module.exports = {
   paymentSandbox: (env.PAYMENT_SANDBOX || 'true') === 'true',
   maxCartQty: parseInt(env.MAX_CART_QTY || '10', 10),
 
-  mongoUri: env.MONGO_URI || 'mongodb://mongo:27017/?replicaSet=rs0',
+  postgres: {
+    host: env.PGHOST || 'postgres',
+    port: parseInt(env.PGPORT || '5432', 10),
+    user: env.PGUSER || 'postgres',
+    password: env.PGPASSWORD || 'postgres',
+  },
   redisUrl: env.REDIS_URL || 'redis://redis:6379',
   amqpUrl: env.AMQP_URL || 'amqp://guest:guest@rabbitmq:5672',
   smtpHost: env.SMTP_HOST || 'mailpit',

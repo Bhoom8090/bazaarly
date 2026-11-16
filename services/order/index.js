@@ -1,14 +1,13 @@
 'use strict';
+// Order service: checkout saga (reserve stock -> authorize payment -> commit -> confirm),
+// idempotent checkout via Idempotency-Key, idempotency keys, sweeper, event consumers.
 require('../../shared/telemetry');
-// Order service: orchestrates the checkout saga (reserve stock -> authorize payment ->
-// commit reservation -> confirm), idempotent checkout via Idempotency-Key, sweeper,
-// and event consumers that move orders forward.
 const crypto = require('crypto');
 const { z } = require('zod');
 const config = require('../../shared/config');
 const logger = require('../../shared/logger');
 const { createApp, finish, listen, asyncH, validate, requireUser, requireAdmin, HttpError } = require('../../shared/http');
-const { connectMongo, mongoose, withTxn } = require('../../shared/db');
+const { connectDb, withTxn, ensureEventTables } = require('../../shared/db');
 const { addOutbox, consume, startOutboxRelay, amqpConnect } = require('../../shared/events');
 const { callService } = require('../../shared/clients');
 const { hashBody } = require('../../shared/idem');
@@ -18,68 +17,89 @@ const { priceLines } = require('../../shared/money');
 const app = createApp('order');
 const PORT = parseInt(process.env.PORT || '4006', 10);
 
-const orderSchema = new mongoose.Schema({
-  _id: String,                    // "402-1234567-1234567"
-  customerId: { type: String, index: true },
-  state: { type: String, index: true, default: 'PENDING_VALIDATION' },
-  items: [Object],                // priced line snapshot
-  address: Object,                // address snapshot
-  pricing: Object,
-  paymentScenario: String,
-  paymentAuthorized: { type: Boolean, default: false },
-  reservationExpiresAt: Date,
-  cancelReason: String,
-  history: [{ from: String, to: String, at: { type: Date, default: Date.now }, note: String }],
-  createdAt: { type: Date, default: Date.now },
-  updatedAt: { type: Date, default: Date.now },
-}, { collection: 'orders', versionKey: false, _id: false });
-const idemSchema = new mongoose.Schema({
-  _id: String,                    // "<userId>:<key>"
-  hash: String,
-  orderId: String,
-  createdAt: { type: Date, default: Date.now, expires: 7 * 24 * 3600 },
-}, { collection: 'idempotency_keys', versionKey: false, _id: false });
-const secAuditSchema = new mongoose.Schema({
-  userId: String, action: String, targetId: String, at: { type: Date, default: Date.now },
-}, { collection: 'security_audit', versionKey: false });
-const Order = mongoose.model('Order', orderSchema);
-const IdemKey = mongoose.model('OrderIdempotencyKey', idemSchema);
-const SecAudit = mongoose.model('OrderSecurityAudit', secAuditSchema);
+const SCHEMA = `
+CREATE TABLE IF NOT EXISTS orders (
+  id                      TEXT PRIMARY KEY,
+  customer_id             TEXT NOT NULL,
+  state                   TEXT NOT NULL DEFAULT 'PENDING_VALIDATION',
+  items                   JSONB NOT NULL,
+  address                 JSONB NOT NULL,
+  pricing                 JSONB NOT NULL,
+  payment_scenario        TEXT,
+  payment_authorized      BOOLEAN NOT NULL DEFAULT false,
+  reservation_expires_at  TIMESTAMPTZ,
+  cancel_reason           TEXT,
+  history                 JSONB NOT NULL DEFAULT '[]',
+  created_at              TIMESTAMPTZ NOT NULL DEFAULT now(),
+  updated_at              TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS orders_customer_idx ON orders (customer_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS orders_state_idx ON orders (state);
+CREATE TABLE IF NOT EXISTS idempotency_keys (
+  key         TEXT PRIMARY KEY,
+  hash        TEXT NOT NULL,
+  order_id    TEXT NOT NULL,
+  created_at  TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE TABLE IF NOT EXISTS security_audit (
+  id          BIGSERIAL PRIMARY KEY,
+  user_id     TEXT NOT NULL,
+  action      TEXT NOT NULL,
+  target_id   TEXT,
+  at          TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+`;
 
-function newOrderId() {
-  return `402-${1000000 + crypto.randomInt(9000000)}-${1000000 + crypto.randomInt(9000000)}`;
-}
+let pool = null;
+const orderId = () => `402-${1000000 + crypto.randomInt(9000000)}-${1000000 + crypto.randomInt(9000000)}`;
 
-async function transition(order, to, note, session) {
-  if (!canTransition(ORDER, order.state, to)) {
-    logger.warn('illegal order transition suppressed', { orderId: order._id, from: order.state, to });
+const state = (row) => row.state;
+const asOrder = (row) => ({
+  _id: row.id,
+  customerId: row.customer_id,
+  state: row.state,
+  items: row.items,
+  address: row.address,
+  pricing: row.pricing,
+  paymentScenario: row.payment_scenario,
+  paymentAuthorized: row.payment_authorized,
+  reservationExpiresAt: row.reservation_expires_at,
+  cancelReason: row.cancel_reason,
+  history: row.history || [],
+  createdAt: row.created_at,
+  updatedAt: row.updated_at,
+});
+
+async function transitionInTxn(client, row, to, note) {
+  if (!canTransition(ORDER, row.state, to)) {
+    logger.warn('illegal order transition suppressed', { orderId: row.id, from: row.state, to });
     return false;
   }
-  const from = order.state;
-  order.state = to;
-  order.updatedAt = new Date();
-  order.history = [...(order.history || []), { from, to, at: new Date(), note }];
-  if (session) await order.save({ session }); else await order.save();
+  const from = row.state;
+  const history = [...(row.history || []), { from, to, at: new Date().toISOString(), note }];
+  await client.query('UPDATE orders SET state = $1, updated_at = now(), history = $2 WHERE id = $3', [to, JSON.stringify(history), row.id]);
+  row.state = to;
+  row.updated_at = new Date();
+  row.history = history;
   return true;
 }
 
 async function cancelOrder(orderId, reason, correlationId, note) {
-  const order = await Order.findById(orderId);
-  if (!order) return;
-  if (['CANCELLED', 'PAYMENT_FAILED', 'EXPIRED'].includes(order.state)) return;
+  const r = await pool.query('SELECT * FROM orders WHERE id = $1', [orderId]);
+  const row = r.rows[0];
+  if (!row) return;
+  if (['CANCELLED', 'PAYMENT_FAILED', 'EXPIRED'].includes(row.state)) return;
   const target = reason === 'PAYMENT_FAILED' ? 'PAYMENT_FAILED' : reason === 'EXPIRED' ? 'EXPIRED' : 'CANCELLED';
-  await withTxn(async (session) => {
-    const fresh = await Order.findById(orderId).session(session);
+  await withTxn(pool, async (client) => {
+    const cur = await client.query('SELECT * FROM orders WHERE id = $1 FOR UPDATE', [orderId]);
+    const fresh = cur.rows[0];
     if (!fresh || !canTransition(ORDER, fresh.state, target)) return;
     const from = fresh.state;
-    fresh.cancelReason = reason;
-    fresh.state = target;
-    fresh.updatedAt = new Date();
-    fresh.history = [...(fresh.history || []), { from, to: target, at: new Date(), note: note || reason }];
-    await fresh.save({ session });
-    await addOutbox(session, {
+    const history = [...(fresh.history || []), { from, to: target, at: new Date().toISOString(), note: note || reason }];
+    await client.query('UPDATE orders SET state = $1, cancel_reason = $2, updated_at = now(), history = $3 WHERE id = $4', [target, reason, JSON.stringify(history), orderId]);
+    await addOutbox(client, {
       eventType: 'OrderCancelled.v1', producer: 'order', aggregateId: orderId, correlationId,
-      payload: { orderId, customerId: fresh.customerId, reason },
+      payload: { orderId, customerId: fresh.customer_id, reason },
     });
   });
 }
@@ -89,7 +109,6 @@ const checkoutSchema = z.object({
   paymentScenario: z.enum(['success', 'failure', 'async', 'timeout']).default('success'),
 });
 
-// POST /v1/checkout
 app.post('/v1/checkout', requireUser, asyncH(async (req, res) => {
   const idemKeyHeader = req.header('idempotency-key');
   if (!idemKeyHeader || idemKeyHeader.length < 8 || idemKeyHeader.length > 128) {
@@ -100,12 +119,12 @@ app.post('/v1/checkout', requireUser, asyncH(async (req, res) => {
   const idemId = `${req.user.id}:${idemKeyHeader}`;
 
   // Idempotency replay
-  const existing = await IdemKey.findById(idemId);
-  if (existing) {
-    if (existing.hash !== hash) throw new HttpError(409, 'IDEMPOTENCY_KEY_REUSED', 'Same Idempotency-Key was used with a different body');
-    const order = await Order.findById(existing.orderId);
+  const existing = await pool.query('SELECT * FROM idempotency_keys WHERE key = $1', [idemId]);
+  if (existing.rows.length) {
+    if (existing.rows[0].hash !== hash) throw new HttpError(409, 'IDEMPOTENCY_KEY_REUSED', 'Same Idempotency-Key was used with a different body');
+    const o = await pool.query('SELECT * FROM orders WHERE id = $1', [existing.rows[0].order_id]);
     res.setHeader('Idempotent-Replayed', 'true');
-    return sendOrderResponse(res, order, true);
+    return sendOrderResponse(res, o.rows[0] ? asOrder(o.rows[0]) : null, true);
   }
 
   // 1. Load cart
@@ -126,161 +145,157 @@ app.post('/v1/checkout', requireUser, asyncH(async (req, res) => {
   const { items, pricing } = priceLines(cartItems.map((i) => ({ sku: i.sku, quantity: i.quantity })), byId);
 
   // 4. Create order in PENDING_VALIDATION
-  const orderId = newOrderId();
-  const order = await Order.create({
-    _id: orderId, customerId: req.user.id, state: 'PENDING_VALIDATION',
-    items, address, pricing, paymentScenario: body.paymentScenario,
-    history: [{ from: null, to: 'PENDING_VALIDATION', at: new Date(), note: 'Checkout started' }],
-  });
+  const orderIdNew = orderId();
+  const historySeed = JSON.stringify([{ from: null, to: 'PENDING_VALIDATION', at: new Date().toISOString(), note: 'Checkout started' }]);
+  await pool.query(
+    `INSERT INTO orders (id, customer_id, state, items, address, pricing, payment_scenario, history)
+     VALUES ($1,$2,'PENDING_VALIDATION',$3,$4,$5,$6,$7)`,
+    [orderIdNew, req.user.id, JSON.stringify(items), JSON.stringify(address), JSON.stringify(pricing), body.paymentScenario, historySeed]);
 
-  // Persist idempotency key before risky work
+  // Persist idempotency key
   try {
-    await IdemKey.create({ _id: idemId, hash, orderId });
+    await pool.query('INSERT INTO idempotency_keys (key, hash, order_id) VALUES ($1,$2,$3)', [idemId, hash, orderIdNew]);
   } catch (e) {
-    if (e.code === 11000) {
-      // Concurrent same-key request won the race; return that order.
-      const winner = await IdemKey.findById(idemId);
-      const winnerOrder = winner && await Order.findById(winner.orderId);
+    if (e.code === '23505') {
+      const winner = await pool.query('SELECT * FROM idempotency_keys WHERE key = $1', [idemId]);
+      const w = winner.rows[0];
+      const wo = w && (await pool.query('SELECT * FROM orders WHERE id = $1', [w.order_id])).rows[0];
       res.setHeader('Idempotent-Replayed', 'true');
-      return sendOrderResponse(res, winnerOrder, true);
+      return sendOrderResponse(res, wo ? asOrder(wo) : null, true);
     }
     throw e;
   }
 
-  // 5. Reserve stock (all-or-nothing)
+  // 5. Reserve stock
   const reserveRes = await callService(config.services.inventory, '/internal/reservations', {
-    method: 'POST', body: { orderId, items: items.map((i) => ({ sku: i.sku, quantity: i.quantity })), ttlSeconds: config.reservationTtlSeconds },
+    method: 'POST', body: { orderId: orderIdNew, items: items.map((i) => ({ sku: i.sku, quantity: i.quantity })), ttlSeconds: config.reservationTtlSeconds },
     cid: req.correlationId, timeoutMs: 8000, retries: 0,
   });
   if (!reserveRes.ok) {
     const unavailable = reserveRes.data?.error?.unavailable || reserveRes.data?.unavailable;
-    await cancelOrder(orderId, 'OUT_OF_STOCK', req.correlationId, 'Insufficient stock for: ' + JSON.stringify(unavailable || []));
-    const o = await Order.findById(orderId);
-    return res.status(409).json({ error: { code: 'OUT_OF_STOCK', message: 'Some items are out of stock', unavailable, orderId, correlationId: req.correlationId }, order: o });
+    await cancelOrder(orderIdNew, 'OUT_OF_STOCK', req.correlationId, 'Insufficient stock for: ' + JSON.stringify(unavailable || []));
+    const o = await pool.query('SELECT * FROM orders WHERE id = $1', [orderIdNew]);
+    return res.status(409).json({ error: { code: 'OUT_OF_STOCK', message: 'Some items are out of stock', unavailable, orderId: orderIdNew, correlationId: req.correlationId }, order: o.rows[0] ? asOrder(o.rows[0]) : null });
   }
   const reservationExpiresAt = reserveRes.data.reservationExpiresAt;
-  await transition(order, 'INVENTORY_RESERVED', 'Stock reserved');
-  order.reservationExpiresAt = reservationExpiresAt ? new Date(reservationExpiresAt) : new Date(Date.now() + config.reservationTtlSeconds * 1000);
-  await order.save();
+  await withTxn(pool, async (client) => {
+    const cur = await client.query('SELECT * FROM orders WHERE id = $1 FOR UPDATE', [orderIdNew]);
+    const row = cur.rows[0];
+    if (row) {
+      await transitionInTxn(client, row, 'INVENTORY_RESERVED', 'Stock reserved');
+      if (reservationExpiresAt) await client.query('UPDATE orders SET reservation_expires_at = $1 WHERE id = $2', [reservationExpiresAt, orderIdNew]);
+    }
+  });
+  await withTxn(pool, async (client) => {
+    const cur = await client.query('SELECT * FROM orders WHERE id = $1 FOR UPDATE', [orderIdNew]);
+    const row = cur.rows[0];
+    if (row) await transitionInTxn(client, row, 'PAYMENT_PENDING', 'Awaiting payment authorization');
+  });
 
-  // 6. Move to PAYMENT_PENDING and authorize
-  await transition(order, 'PAYMENT_PENDING', 'Awaiting payment authorization');
+  // 6. Authorize payment
   const payRes = await callService(config.services.payment, '/internal/payments/authorize', {
-    method: 'POST', body: { orderId, amount: pricing.total, currency: 'INR', scenario: body.paymentScenario, customerId: req.user.id },
+    method: 'POST', body: { orderId: orderIdNew, amount: pricing.total, currency: 'INR', scenario: body.paymentScenario, customerId: req.user.id },
     cid: req.correlationId, timeoutMs: body.paymentScenario === 'timeout' ? 12000 : 6000, retries: 0,
   });
   const payStatus = payRes.data?.status;
 
   if (payStatus === 'AUTHORIZED') {
-    const confirmed = await confirmOrder(orderId, req.correlationId);
-    return sendOrderResponse(res, confirmed, false, 201);
+    const confirmed = await confirmOrder(orderIdNew, req.correlationId);
+    return sendOrderResponse(res, confirmed ? asOrder(confirmed) : null, false, 201);
   }
   if (payStatus === 'FAILED') {
-    await cancelOrder(orderId, 'PAYMENT_FAILED', req.correlationId, 'Payment declined by provider');
-    const o = await Order.findById(orderId);
-    return res.status(402).json({ error: { code: 'PAYMENT_FAILED', message: 'Payment was declined', orderId, correlationId: req.correlationId }, order: o });
+    await cancelOrder(orderIdNew, 'PAYMENT_FAILED', req.correlationId, 'Payment declined by provider');
+    const o = await pool.query('SELECT * FROM orders WHERE id = $1', [orderIdNew]);
+    return res.status(402).json({ error: { code: 'PAYMENT_FAILED', message: 'Payment was declined', orderId: orderIdNew, correlationId: req.correlationId }, order: o.rows[0] ? asOrder(o.rows[0]) : null });
   }
-  // Async or timeout: respond 202 pending; webhook/reconciliation/sweeper will finish.
-  const o = await Order.findById(orderId);
-  return res.status(202).json({ order: o, pending: true, correlationId: req.correlationId });
+  // Async/timeout: 202 pending; webhook/reconciler/sweeper will finish
+  const o = await pool.query('SELECT * FROM orders WHERE id = $1', [orderIdNew]);
+  return res.status(202).json({ order: o.rows[0] ? asOrder(o.rows[0]) : null, pending: true, correlationId: req.correlationId });
 }));
 
 async function confirmOrder(orderId, correlationId) {
-  // Commit reservation THEN mark CONFIRMED + outbox OrderConfirmed.v1 in one transaction.
   const commitRes = await callService(config.services.inventory, `/internal/reservations/${orderId}/commit`, { method: 'POST', body: {}, cid: correlationId, timeoutMs: 8000, retries: 2 });
   if (!commitRes.ok) {
     logger.warn('reservation commit failed; sweeper will retry', { orderId, status: commitRes.status });
-    return Order.findById(orderId);
+    const o = await pool.query('SELECT * FROM orders WHERE id = $1', [orderId]);
+    return o.rows[0] || null;
   }
-  // Mark CONFIRMED + emit OrderConfirmed.v1 in ONE transaction, then clear the cart.
   let justConfirmed = false;
-  await withTxn(async (session) => {
-    const order = await Order.findById(orderId).session(session);
-    if (!order || order.state === 'CONFIRMED') return;
-    if (!canTransition(ORDER, order.state, 'CONFIRMED')) { logger.warn('cannot confirm from state', { orderId, state: order.state }); return; }
-    order.state = 'CONFIRMED';
-    order.paymentAuthorized = true;
-    order.updatedAt = new Date();
-    order.history = [...(order.history || []), { from: 'PAYMENT_PENDING', to: 'CONFIRMED', at: new Date(), note: 'Payment authorized; reservation committed' }];
-    await order.save({ session });
-    await addOutbox(session, {
+  await withTxn(pool, async (client) => {
+    const cur = await client.query('SELECT * FROM orders WHERE id = $1 FOR UPDATE', [orderId]);
+    const row = cur.rows[0];
+    if (!row || row.state === 'CONFIRMED') return;
+    const ok = await transitionInTxn(client, row, 'CONFIRMED', 'Payment authorized; reservation committed');
+    if (!ok) return;
+    await client.query('UPDATE orders SET payment_authorized = true WHERE id = $1', [orderId]);
+    await addOutbox(client, {
       eventType: 'OrderConfirmed.v1', producer: 'order', aggregateId: orderId, correlationId,
-      payload: { orderId, customerId: order.customerId, total: order.pricing.total, currency: order.pricing.currency, items: order.items },
+      payload: { orderId, customerId: row.customer_id, total: row.pricing.total, currency: row.pricing.currency, items: row.items },
     });
     justConfirmed = true;
   });
-  // Clear the user's cart synchronously — but only on the actual transition,
-  // never on replayed confirm calls (would wipe a cart refilled afterwards).
   if (justConfirmed) {
-    const confirmed = await Order.findById(orderId).lean();
-    if (confirmed?.customerId) {
-      callService(config.services.cart, `/internal/carts/${confirmed.customerId}`, { method: 'DELETE', timeoutMs: 3000, retries: 0 })
+    const o = await pool.query('SELECT * FROM orders WHERE id = $1', [orderId]);
+    const customerId = o.rows[0]?.customer_id;
+    if (customerId) {
+      callService(config.services.cart, `/internal/carts/${customerId}`, { method: 'DELETE', timeoutMs: 3000, retries: 0 })
         .then(() => logger.info('cart cleared for order', { orderId }))
-        .catch((e) => logger.warn('cart clear failed (event backstop remains)', { orderId, err: e.message }));
+        .catch((e) => logger.warn('cart clear failed', { orderId, err: e.message }));
     }
   }
-  return Order.findById(orderId);
+  const o = await pool.query('SELECT * FROM orders WHERE id = $1', [orderId]);
+  return o.rows[0] || null;
 }
 
 function sendOrderResponse(res, order, replayed, status) {
   if (!order) throw new HttpError(404, 'NOT_FOUND', 'Order not found');
-  const state = order.state;
+  const st = order.state;
   if (status) return res.status(status).json({ order, ...(replayed ? { replayed: true } : {}) });
-  if (state === 'CONFIRMED') return res.status(201).json({ order, ...(replayed ? { replayed: true } : {}) });
-  if (['CANCELLED'].includes(state)) return res.status(409).json({ order, ...(replayed ? { replayed: true } : {}) });
-  if (state === 'PAYMENT_FAILED') return res.status(402).json({ order, ...(replayed ? { replayed: true } : {}) });
-  if (state === 'EXPIRED') return res.status(409).json({ order, ...(replayed ? { replayed: true } : {}) });
+  if (st === 'CONFIRMED') return res.status(201).json({ order, ...(replayed ? { replayed: true } : {}) });
+  if (['CANCELLED'].includes(st)) return res.status(409).json({ order, ...(replayed ? { replayed: true } : {}) });
+  if (st === 'PAYMENT_FAILED') return res.status(402).json({ order, ...(replayed ? { replayed: true } : {}) });
+  if (st === 'EXPIRED') return res.status(409).json({ order, ...(replayed ? { replayed: true } : {}) });
   return res.status(202).json({ order, pending: true, ...(replayed ? { replayed: true } : {}) });
 }
 
-// GET /v1/orders
 app.get('/v1/orders', requireUser, asyncH(async (req, res) => {
-  const orders = await Order.find({ customerId: req.user.id }).sort({ createdAt: -1 }).limit(50).lean();
-  res.json({ orders });
+  const r = await pool.query('SELECT * FROM orders WHERE customer_id = $1 ORDER BY created_at DESC LIMIT 50', [req.user.id]);
+  res.json({ orders: r.rows.map(asOrder) });
 }));
 
-// GET /v1/orders/:id — owner or admin; otherwise 404 + security_audit row
 app.get('/v1/orders/:id', requireUser, asyncH(async (req, res) => {
-  const order = await Order.findById(req.params.id).lean();
-  if (!order) throw new HttpError(404, 'NOT_FOUND', 'Order not found');
-  const isOwner = order.customerId === req.user.id;
+  const r = await pool.query('SELECT * FROM orders WHERE id = $1', [req.params.id]);
+  const row = r.rows[0];
+  if (!row) throw new HttpError(404, 'NOT_FOUND', 'Order not found');
+  const isOwner = row.customer_id === req.user.id;
   const isAdmin = req.user.role === 'admin';
   if (!isOwner && !isAdmin) {
-    await SecAudit.create({ userId: req.user.id, action: 'ORDER_READ_FORBIDDEN', targetId: order._id });
-    throw new HttpError(404, 'NOT_FOUND', 'Order not found'); // do not leak existence
+    await pool.query('INSERT INTO security_audit (user_id, action, target_id) VALUES ($1,$2,$3)', [req.user.id, 'ORDER_READ_FORBIDDEN', row.id]);
+    throw new HttpError(404, 'NOT_FOUND', 'Order not found');
   }
-  res.json({ order });
+  res.json({ order: asOrder(row) });
 }));
 
 app.get('/v1/admin/orders', requireAdmin, asyncH(async (req, res) => {
-  const state = req.query.state ? String(req.query.state) : null;
-  const orders = await Order.find(state ? { state } : {}).sort({ createdAt: -1 }).limit(100).lean();
-  res.json({ orders });
+  const st = req.query.state ? String(req.query.state) : null;
+  const r = await pool.query(st ? 'SELECT * FROM orders WHERE state = $1 ORDER BY created_at DESC LIMIT 100' : 'SELECT * FROM orders ORDER BY created_at DESC LIMIT 100', st ? [st] : []);
+  res.json({ orders: r.rows.map(asOrder) });
 }));
 
-// Internal (service-to-service only — gated by the internal-key guard in createApp).
-// The reporting service polls this to snapshot orders into H2.
-app.get('/internal/admin/orders', asyncH(async (req, res) => {
-  const state = req.query.state ? String(req.query.state) : null;
-  const orders = await Order.find(state ? { state } : {}).sort({ createdAt: -1 }).limit(100).lean();
-  res.json({ orders });
-}));
-
-// Sweeper: every 15s — retry commit for authorized-but-unconfirmed; cancel stale PENDING_VALIDATION (>120s)
+// Sweeper: every 15s retry authorized-but-unconfirmed, cancel stale PENDING_VALIDATION/PAYMENT_PENDING
 setInterval(async () => {
   try {
-    const authorizedUnconfirmed = await Order.find({ state: 'PAYMENT_PENDING', paymentAuthorized: true }).limit(20);
-    for (const o of authorizedUnconfirmed) await confirmOrder(o._id);
-    const stale = await Order.find({ state: 'PENDING_VALIDATION', createdAt: { $lt: new Date(Date.now() - 120000) } }).limit(20);
-    for (const o of stale) await cancelOrder(o._id, 'EXPIRED', undefined, 'Checkout abandoned for over 120s');
-    const pendingLong = await Order.find({ state: 'PAYMENT_PENDING', createdAt: { $lt: new Date(Date.now() - 3600000) } }).limit(20);
-    for (const o of pendingLong) await cancelOrder(o._id, 'EXPIRED', undefined, 'Payment pending too long');
+    const authUnconfirmed = await pool.query("SELECT * FROM orders WHERE state = 'PAYMENT_PENDING' AND payment_authorized = true LIMIT 20");
+    for (const row of authUnconfirmed.rows) await confirmOrder(row.id);
+    const stale = await pool.query("SELECT id FROM orders WHERE state = 'PENDING_VALIDATION' AND created_at < now() - interval '120 seconds' LIMIT 20");
+    for (const row of stale.rows) await cancelOrder(row.id, 'EXPIRED', undefined, 'Checkout abandoned for over 120s');
+    const pendingLong = await pool.query("SELECT id FROM orders WHERE state = 'PAYMENT_PENDING' AND created_at < now() - interval '1 hour' LIMIT 20");
+    for (const row of pendingLong.rows) await cancelOrder(row.id, 'EXPIRED', undefined, 'Payment pending too long');
   } catch (err) {
     logger.warn('sweeper error', { err: err.message });
   }
 }, 15000).unref();
 
-// React to reservation expiry: cancel owning order
 async function handleReservationExpired(envl) {
   const orderId = (envl.payload || {}).orderId;
   if (!orderId) return;
@@ -288,36 +303,36 @@ async function handleReservationExpired(envl) {
 }
 
 (async () => {
-  await connectMongo('orders');
+  pool = await connectDb('bazaarly_orders');
+  await pool.query(SCHEMA);
+  await ensureEventTables(pool);
   await amqpConnect().catch(() => {});
-  startOutboxRelay('order');
+  startOutboxRelay('order', pool);
   await consume('order.payment-events', async (envl) => {
     const p = envl.payload || {};
     if (envl.event_type === 'PaymentAuthorized.v1') {
-      const order = await Order.findById(p.orderId);
-      if (!order) return;
-      order.paymentAuthorized = true;
-      order.updatedAt = new Date();
-      await order.save();
+      await pool.query('UPDATE orders SET payment_authorized = true, updated_at = now() WHERE id = $1 AND payment_authorized = false', [p.orderId]);
       await confirmOrder(p.orderId, envl.correlation_id);
     } else if (envl.event_type === 'PaymentFailed.v1') {
       await cancelOrder(p.orderId, 'PAYMENT_FAILED', envl.correlation_id, 'Payment failed');
     }
-  });
+  }, pool);
   await consume('order.inventory-events', async (envl) => {
     const p = envl.payload || {};
     if (envl.event_type === 'ReservationExpired.v1') await handleReservationExpired(envl);
-    // InventoryReserved.v1: informational for the order saga (already handled synchronously)
-  });
+  }, pool);
   await consume('order.tracking', async (envl) => {
     const p = envl.payload || {};
     const map = { LABELLED: 'FULFILLING', IN_TRANSIT: 'FULFILLING', OUT_FOR_DELIVERY: 'SHIPPED', DELIVERED: 'DELIVERED', CREATED: null };
     const target = map[p.status];
     if (!target) return;
-    const order = await Order.findById(p.orderId);
-    if (!order) return;
-    if (canTransition(ORDER, order.state, target)) await transition(order, target, `Shipment status: ${p.status}`);
-  });
+    const r = await pool.query('SELECT * FROM orders WHERE id = $1', [p.orderId]);
+    const row = r.rows[0];
+    if (!row || !canTransition(ORDER, row.state, target)) return;
+    const from = row.state;
+    const history = [...(row.history || []), { from, to: target, at: new Date().toISOString(), note: `Shipment status: ${p.status}` }];
+    await pool.query('UPDATE orders SET state = $1, updated_at = now(), history = $2 WHERE id = $3', [target, JSON.stringify(history), row.id]);
+  }, pool);
   finish(app);
   listen(app, PORT, 'order');
 })().catch((err) => { logger.error('order failed to start', { err: err.message }); process.exit(1); });
