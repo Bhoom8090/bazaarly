@@ -6,3 +6,5 @@ coverage
 .DS_Store
 bazaarly.zip
 services/reporting/target/
+backups/
+tests/load/load-report-*.json

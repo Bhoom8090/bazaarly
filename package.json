@@ -4,7 +4,7 @@
   "private": true,
   "description": "Bazaarly - scalable microservices-based e-commerce platform (MERN). Amazon-like theme, single merchant, INR, sandbox payments.",
   "engines": {
-    "node": ">=20"
+    "node": ">=22.15"
   },
   "scripts": {
     "check": "node scripts/check-syntax.js",
@@ -13,6 +13,12 @@
     "test:load": "node tests/load/load.js"
   },
   "dependencies": {
+    "@opentelemetry/api": "^1.10.0",
+    "@opentelemetry/auto-instrumentations-node": "^0.83.1",
+    "@opentelemetry/exporter-trace-otlp-http": "^0.301.2",
+    "@opentelemetry/resources": "^3.1.1",
+    "@opentelemetry/sdk-node": "^0.301.2",
+    "@opentelemetry/semantic-conventions": "^1.45.0",
     "amqplib": "^0.10.4",
     "bcryptjs": "^2.4.3",
     "cookie-parser": "^1.4.6",

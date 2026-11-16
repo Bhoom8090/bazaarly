@@ -1,4 +1,5 @@
 'use strict';
+require('../../shared/telemetry');
 // Cart service: Redis-backed carts (hash per user, 7d TTL), repriced via catalog on every read.
 const { z } = require('zod');
 const redis = require('ioredis');

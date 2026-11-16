@@ -1,0 +1,19 @@
+{
+  "base": "http://127.0.0.1:8080",
+  "workload": "browse",
+  "duration_s": 20,
+  "concurrency": 20,
+  "requests": 8770,
+  "ok": 8768,
+  "errors": 2,
+  "error_rate": 0.0002,
+  "rps": 438.5,
+  "latency_ms": {
+    "min": 17.8,
+    "p50": 42.2,
+    "p95": 64.2,
+    "p99": 108.1,
+    "max": 304.2
+  },
+  "saved_at": "2026-11-16T12:14:44.179Z"
+}

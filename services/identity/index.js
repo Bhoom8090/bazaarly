@@ -1,4 +1,5 @@
 'use strict';
+require('../../shared/telemetry');
 // Identity service: users, auth (JWT in HttpOnly cookie), addresses, admin MFA.
 const { v4: uuid } = require('uuid');
 const bcrypt = require('bcryptjs');

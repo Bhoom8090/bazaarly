@@ -1,4 +1,5 @@
 'use strict';
+require('../../shared/telemetry');
 // Catalog service: products, categories, cursor pagination, Redis cache,
 // admin mutations with optimistic concurrency, audit log and outbox events.
 const { z } = require('zod');

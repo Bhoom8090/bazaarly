@@ -1,4 +1,5 @@
 'use strict';
+require('../../shared/telemetry');
 // API gateway: single public entry. JWT verification (cookie or Bearer) with Redis
 // revocation denylist, CSRF enforcement for cookie-authenticated mutations, fixed-window
 // rate limits in Redis, route table proxying to internal services, OpenAPI docs.

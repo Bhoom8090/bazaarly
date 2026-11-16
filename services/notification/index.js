@@ -1,4 +1,5 @@
 'use strict';
+require('../../shared/telemetry');
 // Notification service: per-user inbox fed by domain events, email via Mailpit (nodemailer),
 // per-user dedupe keys, preferences, and unread counts. Email failure never affects orders.
 const nodemailer = require('nodemailer');

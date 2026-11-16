@@ -1,4 +1,5 @@
 'use strict';
+require('../../shared/telemetry');
 // MOCK PSP — in-memory fake payment service provider for sandbox testing only.
 // Never use real card data. Supports idempotency-key replay and 4 test scenarios.
 const express = require('express');

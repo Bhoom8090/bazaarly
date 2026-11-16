@@ -1,4 +1,5 @@
 'use strict';
+require('../../shared/telemetry');
 // Search service: read-optimised projection of the catalog, kept fresh via
 // ProductChanged.v1 events. Rebuildable from the catalog at any time.
 const { z } = require('zod');

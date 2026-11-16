@@ -1,4 +1,5 @@
 'use strict';
+require('../../shared/telemetry');
 // Payment service: attempts (unique per order), provider adapter to the mock PSP,
 // signed webhooks with dedupe, reconciler for stale attempts, capture/void driven by order events.
 // NO PAN/CVV is ever stored or logged.
@@ -70,9 +71,11 @@ async function emitPaymentEvent(session, type, attempt, correlationId) {
   });
 }
 
-// Transition attempt with guarded update. Returns {changed, attempt}.
+// Transition attempt with guarded update. Only matches rows NOT already in the target
+// state, so re-entered transitions (duplicate webhooks, reconciler races) are no-ops
+// and never double-emit events. Returns the updated doc, or null.
 async function transitionAttempt(id, fromStates, to, extra = {}, session) {
-  const q = { _id: id, status: { $in: fromStates } };
+  const q = { _id: id, status: { $in: fromStates, $ne: to } };
   const update = { $set: { status: to, updatedAt: new Date(), ...extra } };
   if (session) return Attempt.findOneAndUpdate(q, update, { new: true, session });
   return Attempt.findOneAndUpdate(q, update, { new: true });

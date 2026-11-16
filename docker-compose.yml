@@ -12,6 +12,7 @@ x-service-common: &service-common
     rabbitmq:
       condition: service_started
   environment: &service-env
+    OTEL_EXPORTER_OTLP_ENDPOINT: http://jaeger:4318
     MONGO_URI: mongodb://mongo:27017/?replicaSet=rs0
     REDIS_URL: redis://redis:6379
     AMQP_URL: amqp://guest:guest@rabbitmq:5672
@@ -33,6 +34,8 @@ x-service-common: &service-common
     EVENT_MAX_ATTEMPTS: ${EVENT_MAX_ATTEMPTS:-5}
     RATE_LIMIT_PER_MIN: ${RATE_LIMIT_PER_MIN:-1000}
     AUTH_RATE_LIMIT_PER_MIN: ${AUTH_RATE_LIMIT_PER_MIN:-200}
+    SEARCH_RATE_LIMIT_PER_MIN: ${SEARCH_RATE_LIMIT_PER_MIN:-120}
+    CHECKOUT_RATE_LIMIT_PER_MIN: ${CHECKOUT_RATE_LIMIT_PER_MIN:-10}
     PAYMENT_SANDBOX: ${PAYMENT_SANDBOX:-true}
     MAX_CART_QTY: ${MAX_CART_QTY:-10}
     IDENTITY_URL: http://identity:4001
@@ -48,6 +51,16 @@ x-service-common: &service-common
     REPORTING_URL: http://reporting:4011
 
 services:
+  jaeger:
+    image: jaegertracing/all-in-one:latest
+    environment:
+      COLLECTOR_OTLP_ENABLED: 'true'
+      SPAN_STORAGE_TYPE: badger
+    ports:
+      - "16686:16686"   # Jaeger UI (trace visualization)
+      - "4317:4317"     # OTLP gRPC
+      - "4318:4318"     # OTLP HTTP
+
   mongo:
     image: mongo:7
     command: ["mongod", "--replSet", "rs0", "--bind_ip_all"]

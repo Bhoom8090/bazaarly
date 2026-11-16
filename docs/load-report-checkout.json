@@ -1,0 +1,19 @@
+{
+  "base": "http://127.0.0.1:8080",
+  "workload": "checkout",
+  "duration_s": 20,
+  "concurrency": 8,
+  "requests": 496,
+  "ok": 496,
+  "errors": 0,
+  "error_rate": 0,
+  "rps": 24.8,
+  "latency_ms": {
+    "min": 153.1,
+    "p50": 271.5,
+    "p95": 522.2,
+    "p99": 832.5,
+    "max": 976.7
+  },
+  "saved_at": "2026-11-16T12:16:49.416Z"
+}

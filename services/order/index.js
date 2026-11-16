@@ -1,4 +1,5 @@
 'use strict';
+require('../../shared/telemetry');
 // Order service: orchestrates the checkout saga (reserve stock -> authorize payment ->
 // commit reservation -> confirm), idempotent checkout via Idempotency-Key, sweeper,
 // and event consumers that move orders forward.

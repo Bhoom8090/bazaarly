@@ -1,4 +1,5 @@
 'use strict';
+require('../../shared/telemetry');
 // Inventory service: stock balances, reservations (all-or-nothing saga step),
 // availability, admin adjustments with audit trail.
 const { z } = require('zod');

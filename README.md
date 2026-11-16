@@ -24,7 +24,7 @@
    ┌──────┬──────┬──────┬──────┬──────┬──────┬──────┬──────┬─┴───┐
    ▼      ▼      ▼      ▼      ▼      ▼      ▼      ▼      ▼     ▼
   identity catalog search inventory cart order payment notif fulfilment mock-psp  reporting
-  (Node 20 + Express + Mongoose services, one DB each)  (Java + H2 analytics, no DB)
+  (Node 22 + Express + Mongoose services, one DB each)  (Java + H2 analytics, no DB)
       ▼      ▼      ▼      ▼          ▼            ▼
     mongo  redis  rabbitmq  .        .            .
  (db/svc) (cart/ (outbox → topic exchange commerce.events / DLQ)
@@ -42,7 +42,7 @@ Every service owns its own MongoDB database. Cross-service consistency uses a **
 - Accessibility: skip link, labels, `:focus-visible` rings, `aria-live` regions, keyboard operable
 
 ### API Gateway — `services/gateway/`
-- **Node 20 + Express 4**, single public entry point (port **8080**)
+- **Node 22 + Express 4**, single public entry point (port **8080**)
 - Verifies **JWT** (HttpOnly `token` cookie or `Authorization: Bearer`) with a Redis revocation denylist (`revoked:<jti>`)
 - **CSRF** double-submit check for cookie-authenticated mutating requests (`X-CSRF-Token` vs token claim)
 - **Rate limits** in Redis (global per IP, auth, checkout per user, search)
@@ -53,7 +53,7 @@ Every service owns its own MongoDB database. Cross-service consistency uses a **
 ### Shared library — `shared/`
 Common code used by every service: `config.js` (env), `logger.js` (JSON logs with secret redaction), `http.js` (app factory: correlation-id, Prometheus `http_request_duration_seconds`, `/health`, `/metrics`, internal-key guard, zod validation, `HttpError`, error handler), `db.js` (Mongo connect with retry, **transactions** via `withTxn`), `events.js` (outbox + AMQP consumer with dedupe/retry/DLQ), `topology.js` (all queues/bindings declared at connect), `clients.js` (service-to-service HTTP with timeout, retry, per-host circuit breaker), `money.js` (paise integer math, 18% GST inclusive, free shipping ≥ ₹499), `fsm.js` (order/payment/shipment/reservation state machines), `idem.js`, `webhook.js` (HMAC-SHA256 verify, timing-safe, 300s tolerance).
 
-### Services — `services/` (Node 20 + Express + Mongoose unless noted, own DB)
+### Services — `services/` (Node 22 + Express + Mongoose unless noted, own DB)
 
 | Service | Port | DB | Responsibility |
 |---|---|---|---|
@@ -86,13 +86,23 @@ Common code used by every service: `config.js` (env), `logger.js` (JSON logs wit
 - **Prometheus** (:9090) — scrapes `/metrics` of every service; alert rules: service down, DLQ growth, outbox backlog
 - **Grafana** (:3001, admin/admin) — provisioned Prometheus datasource + “Bazaarly Overview” dashboard (request rate, p95, DLQ, outbox backlog)
 - **Mailpit** (:8025 + SMTP 1025) — captures all outbound email; **Miniflare-like mock PSP** above — no real payments
+- **Jaeger** (:16686, UI) + **OpenTelemetry** SDK in every Node service (`shared/telemetry.js`) exporting OTLP → trace one checkout across gateway → order → cart/catalog/identity/inventory/payment + mock PSP end-to-end
 - **`Dockerfile.service`** — generic image (`ARG SERVICE=<name>`); **`docker-compose.yml`** orchestrates all 13 services + Mongo/Redis/RabbitMQ/Mailpit/Prometheus/Grafana; **`.github/workflows/ci.yml`** runs syntax check, unit tests, frontend build and compose build on push
 
 ### Tests & scripts — `tests/`, `scripts/`
 - `tests/unit/` — Jest: money math, webhook signature, circuit breaker, FSMs, idempotency hash
 - `tests/acceptance/run.js` — V-01..V-10 against the running stack (pagination, **50 concurrent checkouts for 1 unit in stock**, idempotent replay, key reuse, timeout reconciliation, stock release, webhook dedupe, cross-user 404)
-- `tests/load/load.js` — V-12 load test (p50/p95/p99, RPS, error rate)
+- `tests/load/load.js` — V-12 load test (browse workload default; `WORKLOAD=checkout node tests/load/load.js` for the authenticated checkout saga), saves JSON report
 - `scripts/backup-restore.sh` — V-11 mongodump/restore for the stack’s databases · `scripts/check-syntax.js`
+
+## Documentation
+
+- [`docs/CH4_ADDENDUM.md`](docs/CH4_ADDENDUM.md) — implemented-vs-report deviations + measured V-01…V-12 results + load-test numbers
+- [`docs/DEMO_MANUAL_TESTS.md`](docs/DEMO_MANUAL_TESTS.md) — step-by-step V-08/V-09/V-11 (broker outage, mailpit down, backup/restore)
+- [`docs/SECURITY.md`](docs/SECURITY.md) — OWASP-aligned security controls implemented
+- [`docs/ACCESSIBILITY.md`](docs/ACCESSIBILITY.md) — WCAG 2.2 code review of the UI
+- [`docs/REPLICATION_SPEC.txt`](docs/REPLICATION_SPEC.txt) — original build spec
+- Measured load reports: [`docs/load-report-browse.json`](docs/load-report-browse.json), [`docs/load-report-checkout.json`](docs/load-report-checkout.json)
 
 ## How to run (Docker Desktop)
 
@@ -122,6 +132,7 @@ docker compose up --build
 |------|-----|-------------|
 | Swagger / OpenAPI | http://localhost:8080/api-docs | — |
 | H2 database console (reporting) | http://localhost:4011/h2-console | JDBC `jdbc:h2:mem:bazaarly_report`, user `sa`, no password |
+| **Jaeger** (traces, all services) | http://localhost:16686 | search service name, e.g. `order` |
 | Mailpit (captured emails) | http://localhost:8025 | — |
 | RabbitMQ UI | http://localhost:15672 | guest / guest |
 | Grafana | http://localhost:3001 | admin / admin |

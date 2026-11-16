@@ -1,4 +1,5 @@
 'use strict';
+require('../../shared/telemetry');
 // Fulfilment service: shipments created from OrderConfirmed.v1, admin-driven milestone
 // updates with guarded transitions, append-only event log, TrackingUpdated.v1 outbox.
 const { v4: uuid } = require('uuid');

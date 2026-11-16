@@ -70,6 +70,7 @@ async function amqpConnect() {
         await topo.declareAll(ch); // every service declares ALL queues+bindings (idempotent)
         connection = conn;
         channel = ch;
+        await attachConsumers();   // re-register all consumers on the NEW channel
         logger.info('amqp connected', { url: config.amqpUrl.replace(/:[^:@]*@/, ':***@') });
         return ch;
       } catch (err) {
@@ -79,6 +80,17 @@ async function amqpConnect() {
     }
   })();
   return connecting;
+}
+
+// sendToQueue throws synchronously on a dead channel — guard it.
+function sendToQueueSafe(ch, queue, content, options) {
+  try {
+    ch.sendToQueue(queue, content, options);
+    return true;
+  } catch (err) {
+    logger.warn('sendToQueue failed (broker likely down); message will be retried by relay/consumer logic', { queue, err: err.message });
+    return false;
+  }
 }
 
 async function getChannel() {
@@ -99,7 +111,7 @@ function startOutboxRelay(serviceName) {
         const ok = ch.publish(EXCHANGE, row.event_type, Buffer.from(JSON.stringify(row.envelope)), {
           persistent: true, contentType: 'application/json', messageId: row.event_id,
         });
-        void ok;
+        if (!ok) throw new Error('broker backpressure; will retry next tick');
         await Model.updateOne({ _id: row._id }, { $set: { publishedAt: new Date() } });
       }
     } catch (err) {
@@ -125,47 +137,73 @@ function processedModel() {
   return ProcessedModel;
 }
 
-async function consume(queueName, handler) {
-  const ch = await getChannel();
+// Consumer registry — handlers are re-attached on every (re)connect so broker
+// outages never leave services deaf to events.
+const consumerRegistry = []; // [{ queueName, handler }]
+
+async function attachConsumer(ch, queueName, handler) {
   await ch.assertQueue(queueName, { durable: true });
   await ch.prefetch(10);
   ch.consume(queueName, async (msg) => {
     if (!msg) return;
-    let envl;
     try {
-      envl = JSON.parse(msg.content.toString());
-    } catch {
-      ch.ack(msg);
-      return;
-    }
-    const P = processedModel();
-    try {
-      const seen = await P.findById(envl.event_id);
-      if (seen) { ch.ack(msg); return; }
-      await handler(envl, msg);
-      await P.create({ _id: envl.event_id, queue: queueName }).catch(() => {});
-      ch.ack(msg);
-    } catch (err) {
-      const attempts = ((msg.properties.headers && msg.properties.headers['x-attempts']) || 0) + 1;
-      logger.warn('event handler failed', { queue: queueName, event: envl.event_type, attempts, err: err.message });
-      if (attempts >= config.eventMaxAttempts) {
-        ch.sendToQueue(DLQ, msg.content, { persistent: true, contentType: 'application/json', headers: { ...(msg.properties.headers || {}), 'x-attempts': attempts, 'x-failed-queue': queueName } });
-        eventsDlq.inc({ queue: queueName });
-        ch.ack(msg);
-      } else {
-        const backoff = Math.min(60000, 500 * Math.pow(2, attempts)) * (0.5 + Math.random() / 2);
-        const retryQueue = `${queueName}.retry`;
-        ch.sendToQueue(retryQueue, msg.content, {
-          persistent: true,
-          contentType: 'application/json',
-          expiration: String(Math.round(backoff)),
-          headers: { ...(msg.properties.headers || {}), 'x-attempts': attempts },
-        });
-        ch.ack(msg);
+      let envl;
+      try {
+        envl = JSON.parse(msg.content.toString());
+      } catch {
+        try { ch.ack(msg); } catch {}
+        return;
       }
+      const P = processedModel();
+      try {
+        const seen = await P.findById(envl.event_id);
+        if (seen) { try { ch.ack(msg); } catch {} return; }
+        await handler(envl, msg);
+        await P.create({ _id: envl.event_id, queue: queueName }).catch(() => {});
+        try { ch.ack(msg); } catch {}
+      } catch (err) {
+        const attempts = ((msg.properties.headers && msg.properties.headers['x-attempts']) || 0) + 1;
+        logger.warn('event handler failed', { queue: queueName, event: envl.event_type, attempts, err: err.message });
+        if (attempts >= config.eventMaxAttempts) {
+          sendToQueueSafe(ch, DLQ, msg.content, { persistent: true, contentType: 'application/json', headers: { ...(msg.properties.headers || {}), 'x-attempts': attempts, 'x-failed-queue': queueName } });
+          try { eventsDlq.inc({ queue: queueName }); } catch {}
+          try { ch.ack(msg); } catch {}
+        } else {
+          const backoff = Math.min(60000, 500 * Math.pow(2, attempts)) * (0.5 + Math.random() / 2);
+          const retryQueue = `${queueName}.retry`;
+          sendToQueueSafe(ch, retryQueue, msg.content, {
+            persistent: true,
+            contentType: 'application/json',
+            expiration: String(Math.round(backoff)),
+            headers: { ...(msg.properties.headers || {}), 'x-attempts': attempts },
+          });
+          try { ch.ack(msg); } catch {}
+        }
+      }
+    } catch (fatal) {
+      // Never let an AMQP/dispatch failure kill the process; requeue best-effort.
+      logger.error('consumer fatal error', { queue: queueName, err: fatal && fatal.message });
+      try { ch.nack(msg, false, true); } catch {}
     }
   });
   logger.info('consuming', { queue: queueName });
+}
+
+async function attachConsumers() {
+  if (!channel) return;
+  for (const { queueName, handler } of consumerRegistry) {
+    try {
+      await attachConsumer(channel, queueName, handler);
+    } catch (err) {
+      logger.warn('failed to attach consumer', { queue: queueName, err: err.message });
+    }
+  }
+}
+
+async function consume(queueName, handler) {
+  consumerRegistry.push({ queueName, handler });
+  const ch = await getChannel();
+  await attachConsumer(ch, queueName, handler);
 }
 
 // Publish helper for one-off events that are not tied to a DB transaction
