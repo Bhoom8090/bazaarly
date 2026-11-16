@@ -23,8 +23,8 @@
            internal network only (x-internal-key required)    │
    ┌──────┬──────┬──────┬──────┬──────┬──────┬──────┬──────┬─┴───┐
    ▼      ▼      ▼      ▼      ▼      ▼      ▼      ▼      ▼     ▼
- identity catalog search inventory cart order payment notif fulfilment mock-psp
-   └──┬──┴───┬──┴────┬──┴───┬──┴─────┴──┬───┴─────┴──┬────┘
+  identity catalog search inventory cart order payment notif fulfilment mock-psp  reporting
+  (Node 20 + Express + Mongoose services, one DB each)  (Java + H2 analytics, no DB)
       ▼      ▼      ▼      ▼          ▼            ▼
     mongo  redis  rabbitmq  .        .            .
  (db/svc) (cart/ (outbox → topic exchange commerce.events / DLQ)
@@ -53,10 +53,11 @@ Every service owns its own MongoDB database. Cross-service consistency uses a **
 ### Shared library — `shared/`
 Common code used by every service: `config.js` (env), `logger.js` (JSON logs with secret redaction), `http.js` (app factory: correlation-id, Prometheus `http_request_duration_seconds`, `/health`, `/metrics`, internal-key guard, zod validation, `HttpError`, error handler), `db.js` (Mongo connect with retry, **transactions** via `withTxn`), `events.js` (outbox + AMQP consumer with dedupe/retry/DLQ), `topology.js` (all queues/bindings declared at connect), `clients.js` (service-to-service HTTP with timeout, retry, per-host circuit breaker), `money.js` (paise integer math, 18% GST inclusive, free shipping ≥ ₹499), `fsm.js` (order/payment/shipment/reservation state machines), `idem.js`, `webhook.js` (HMAC-SHA256 verify, timing-safe, 300s tolerance).
 
-### Services — `services/` (each: Node 20 + Express + Mongoose, own DB)
+### Services — `services/` (Node 20 + Express + Mongoose unless noted, own DB)
 
 | Service | Port | DB | Responsibility |
 |---|---|---|---|
+| reporting **(Java/Spring)** | 4011 | `H2 in-memory` | Analytics API — syncs order snapshot into H2 every 60s; admin summary/top-products/daily-sales/state counts; serves H2 console for demo |
 | identity | 4001 | `identity` | Users, bcrypt password hashing, JWT sessions, addresses, admin TOTP MFA, seeds admin + demo users |
 | catalog | 4002 | `catalog` | 25 seeded products in 6 categories, cursor pagination, Redis cache, admin CRUD with optimistic `expectedVersion` + audit log + outbox `ProductChanged.v1` |
 | search | 4003 | `search` | Read-optimised projection of catalog kept fresh via `ProductChanged.v1`; Mongo text index; `/v1/search` with facets/sort/price filter; rebuildable via reindex endpoint |
@@ -67,6 +68,16 @@ Common code used by every service: `config.js` (env), `logger.js` (JSON logs wit
 | notification | 4008 | `notifications` | Per-user inbox from domain events, deduped; email via nodemailer → **Mailpit**; preferences + unread counts |
 | fulfilment | 4009 | `fulfilment` | Shipments created from `OrderConfirmed.v1` (`SHP-<orderId>`), append-only milestone log, guarded transitions, owner-only tracking endpoint, emits `TrackingUpdated.v1` |
 | mock-psp | 4010 | — | **In-memory mock** payment provider (sandbox only): payment intents, capture/cancel, 4 test scenarios, duplicate webhook delivery, signs webhooks with `PSP_WEBHOOK_SECRET` |
+
+### Reporting service — `services/reporting/` (Java, Spring Boot + H2)
+- **Spring Boot 4 + Java 21 + H2 (in-memory)** — a self-contained analytics API alongside the MERN services
+- Polls `GET /internal/admin/orders` (internal-key) on a schedule (`SYNC_INTERVAL_MS`, default 60s) and snapshots orders + items into H2 tables
+- Serves admin analytics at `/v1/admin/reports/*` (also exposed through the gateway, admin-role required):
+  - `summary` — GMV, revenue orders, avg order value, units sold, by-state counts
+  - `orders-by-state` · `top-products?limit=N` · `daily-sales?days=N` (zero-filled) · `status` · `POST sync`
+- **H2 console** at `http://localhost:4011/h2-console` (demo; JDBC URL `jdbc:h2:mem:bazaarly_report`, user `sa`, no password)
+- Admin UI has a **Reports** tab rendering all of the above
+- 5 JUnit tests cover the analytics math (`AnalyticsCalculator`)
 
 ### Infrastructure & ops — `infra/`, `docker-compose.yml`
 - **MongoDB 7** as a 1-node **replica set** (`mongo` + one-shot `mongo-init` container) so multi-document transactions work
@@ -110,6 +121,7 @@ docker compose up --build
 | Tool | URL | Credentials |
 |------|-----|-------------|
 | Swagger / OpenAPI | http://localhost:8080/api-docs | — |
+| H2 database console (reporting) | http://localhost:4011/h2-console | JDBC `jdbc:h2:mem:bazaarly_report`, user `sa`, no password |
 | Mailpit (captured emails) | http://localhost:8025 | — |
 | RabbitMQ UI | http://localhost:15672 | guest / guest |
 | Grafana | http://localhost:3001 | admin / admin |

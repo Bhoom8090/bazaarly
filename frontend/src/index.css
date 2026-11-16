@@ -166,6 +166,11 @@ table.admin th { background: #f3f3f3; }
 .alert-success { background: #f0faf4; border: 1px solid #067d62; color: #067d62; }
 .alert-info { background: #eef7fd; border: 1px solid #007185; color: #004f5f; }
 .badge { display: inline-block; font-size: 11px; font-weight: 700; border-radius: 10px; padding: 2px 9px; }
+.stats-row { display: grid; grid-template-columns: repeat(auto-fill, minmax(160px, 1fr)); gap: 10px; }
+.stat-card { background: #f3f3f3; border-radius: 6px; padding: 12px; display: flex; flex-direction: column; gap: 2px; }
+.stat-label { font-size: 11px; color: var(--muted); text-transform: uppercase; letter-spacing: .4px; }
+.stat-value { font-size: 21px; font-weight: 800; color: var(--price); }
+.stat-sub { font-size: 11px; color: var(--muted); }
 .badge-state { background: #eef; color: #232f3e; }
 .badge-warn { background: #fff4d6; color: #8a6d00; }
 .badge-ok { background: #e6f6ec; color: #067d62; }

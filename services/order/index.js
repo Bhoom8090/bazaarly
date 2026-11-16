@@ -257,6 +257,14 @@ app.get('/v1/admin/orders', requireAdmin, asyncH(async (req, res) => {
   res.json({ orders });
 }));
 
+// Internal (service-to-service only — gated by the internal-key guard in createApp).
+// The reporting service polls this to snapshot orders into H2.
+app.get('/internal/admin/orders', asyncH(async (req, res) => {
+  const state = req.query.state ? String(req.query.state) : null;
+  const orders = await Order.find(state ? { state } : {}).sort({ createdAt: -1 }).limit(100).lean();
+  res.json({ orders });
+}));
+
 // Sweeper: every 15s — retry commit for authorized-but-unconfirmed; cancel stale PENDING_VALIDATION (>120s)
 setInterval(async () => {
   try {

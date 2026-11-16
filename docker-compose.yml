@@ -45,6 +45,7 @@ x-service-common: &service-common
     NOTIFICATION_URL: http://notification:4008
     FULFILMENT_URL: http://fulfilment:4009
     MOCK_PSP_URL: http://mock-psp:4010
+    REPORTING_URL: http://reporting:4011
 
 services:
   mongo:
@@ -192,6 +193,20 @@ services:
     environment:
       <<: *service-env
       PORT: 4009
+
+  reporting:
+    build:
+      context: ./services/reporting
+      dockerfile: Dockerfile
+    depends_on:
+      order:
+        condition: service_started
+    environment:
+      INTERNAL_KEY: ${INTERNAL_KEY:-dev_internal_key_change_me_0123456789abcdef}
+      ORDER_URL: http://order:4006
+      SYNC_INTERVAL_MS: ${SYNC_INTERVAL_MS:-60000}
+    ports:
+      - "4011:4011"   # reporting API + H2 console at /h2-console (demo)
 
   gateway:
     <<: *service-common

@@ -1,0 +1,27 @@
+server:
+  port: 4011
+
+spring:
+  datasource:
+    url: jdbc:h2:mem:bazaarly_report;DB_CLOSE_DELAY=-1
+    driver-class-name: org.h2.Driver
+    username: sa
+    password: ""
+  jpa:
+    hibernate:
+      ddl-auto: create-drop
+    open-in-view: false
+  h2:
+    console:
+      enabled: true          # demo only; the H2 console is reachable on :4011/h2-console
+      path: /h2-console
+
+reporting:
+  order-url: ${ORDER_URL:http://order:4006}
+  internal-key: ${INTERNAL_KEY:dev_internal_key_change_me_0123456789abcdef}
+  sync-interval-ms: ${SYNC_INTERVAL_MS:60000}
+  sync-initial-delay-ms: ${SYNC_INITIAL_DELAY_MS:3000}
+
+logging:
+  level:
+    com.bazaarly.reporting: INFO

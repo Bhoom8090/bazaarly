@@ -86,6 +86,7 @@ const routes = [
   { method: null, pattern: /^\/v1\/admin\/orders$/, target: R.order, auth: 'admin' },
   { method: null, pattern: /^\/v1\/admin\/shipments(\/|$)/, target: R.fulfilment, auth: 'admin', csrf: true },
   { method: 'POST', pattern: /^\/v1\/admin\/search\/reindex$/, target: R.search, auth: 'admin', csrf: true },
+  { method: null, pattern: /^\/v1\/admin\/reports(\/|$)/, target: R.reporting, auth: 'admin', csrf: true },
 ];
 
 // Global per-IP rate limit

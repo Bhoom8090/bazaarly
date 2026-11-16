@@ -45,5 +45,6 @@ module.exports = {
     notification: env.NOTIFICATION_URL || 'http://notification:4008',
     fulfilment: env.FULFILMENT_URL || 'http://fulfilment:4009',
     mockPsp: env.MOCK_PSP_URL || 'http://mock-psp:4010',
+    reporting: env.REPORTING_URL || 'http://reporting:4011',
   },
 };

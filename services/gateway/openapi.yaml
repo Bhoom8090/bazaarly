@@ -285,6 +285,36 @@ paths:
       tags: [admin]
       summary: Rebuild the search projection from the catalog (admin)
       responses: { '200': { description: Reindexed } }
+  /v1/admin/reports/summary:
+    get:
+      tags: [admin]
+      summary: Reporting API (Spring Boot + H2) — GMV, AOV, units sold, by-state counts
+      responses: { '200': { description: Summary } }
+  /v1/admin/reports/orders-by-state:
+    get:
+      tags: [admin]
+      summary: Order counts per state
+      responses: { '200': { description: "{ states: [{ state, count }] }" } }
+  /v1/admin/reports/top-products:
+    get:
+      tags: [admin]
+      summary: Best-selling products by revenue (limit param, default 5)
+      responses: { '200': { description: "{ products: [{ sku, title, units, revenuePaise }] }" } }
+  /v1/admin/reports/daily-sales:
+    get:
+      tags: [admin]
+      summary: Zero-filled daily revenue buckets (days param, default 7)
+      responses: { '200': { description: "{ days: [{ date, orders, revenuePaise }] }" } }
+  /v1/admin/reports/status:
+    get:
+      tags: [admin]
+      summary: Last H2 sync status and row count
+      responses: { '200': { description: Status } }
+  /v1/admin/reports/sync:
+    post:
+      tags: [admin]
+      summary: Force-refresh the H2 snapshot from the order service
+      responses: { '200': { description: "{ ok, orders, syncedAt }" } }
   /v1/admin/audit:
     get:
       tags: [admin]

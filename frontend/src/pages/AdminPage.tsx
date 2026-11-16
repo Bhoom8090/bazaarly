@@ -3,10 +3,15 @@ import { Link } from 'react-router-dom';
 import { api, formatPrice, Order, Product } from '../api';
 import { useSession } from '../session';
 
-type Tab = 'products' | 'inventory' | 'orders' | 'shipments' | 'system';
+type Tab = 'products' | 'inventory' | 'orders' | 'shipments' | 'system' | 'reports';
 
 interface Balance { sku: string; onHand: number; reserved: number; available: number; version: number }
 interface Shipment { _id: string; orderId: string; customerId: string; state: string; updatedAt: string }
+interface ReportSummary { totalOrders: number; revenueOrders: number; gmvPaise: number; averageOrderValuePaise: number; unitsSold: number; byState: Record<string, number> }
+interface StateCount { state: string; count: number }
+interface ProductStat { sku: string; title: string; units: number; revenuePaise: number }
+interface DailySale { date: string; orders: number; revenuePaise: number }
+interface ReportStatus { lastSyncAt: string | null; ordersSynced: number; lastError: string | null; ordersInH2: number }
 
 export default function AdminPage() {
   const { session, loading } = useSession();
@@ -18,9 +23,33 @@ export default function AdminPage() {
   const [inventory, setInventory] = useState<Balance[]>([]);
   const [orders, setOrders] = useState<Order[]>([]);
   const [shipments, setShipments] = useState<Shipment[]>([]);
+  const [reportSummary, setReportSummary] = useState<ReportSummary | null>(null);
+  const [reportStates, setReportStates] = useState<StateCount[]>([]);
+  const [reportTop, setReportTop] = useState<ProductStat[]>([]);
+  const [reportDaily, setReportDaily] = useState<DailySale[]>([]);
+  const [reportStatus, setReportStatus] = useState<ReportStatus | null>(null);
 
   // New product form
   const [form, setForm] = useState({ title: '', brand: '', category: 'Electronics', price: '', emoji: '🛍️', color: '#37475a', reason: 'New product' });
+
+  async function loadReports() {
+    try {
+      const [s, st, tp, ds, stt] = await Promise.all([
+        api.get<ReportSummary>('/v1/admin/reports/summary'),
+        api.get<{ states: StateCount[] }>('/v1/admin/reports/orders-by-state'),
+        api.get<{ products: ProductStat[] }>('/v1/admin/reports/top-products?limit=5'),
+        api.get<{ days: DailySale[] }>('/v1/admin/reports/daily-sales?days=7'),
+        api.get<ReportStatus>('/v1/admin/reports/status'),
+      ]);
+      setReportSummary(s);
+      setReportStates(st.states || []);
+      setReportTop(tp.products || []);
+      setReportDaily(ds.days || []);
+      setReportStatus(stt);
+    } catch (e: any) {
+      setError(e.message || 'Could not load reports (is the reporting service up?)');
+    }
+  }
 
   useEffect(() => {
     if (!session?.authenticated || session.user?.role !== 'admin') return;
@@ -28,6 +57,7 @@ export default function AdminPage() {
     if (tab === 'inventory') api.get<{ inventory: Balance[] }>('/v1/admin/inventory').then((r) => setInventory(r.inventory)).catch((e) => setError(e.message));
     if (tab === 'orders') api.get<{ orders: Order[] }>('/v1/admin/orders').then((r) => setOrders(r.orders)).catch((e) => setError(e.message));
     if (tab === 'shipments') api.get<{ shipments: Shipment[] }>('/v1/admin/shipments').then((r) => setShipments(r.shipments)).catch((e) => setError(e.message));
+    if (tab === 'reports') loadReports();
   }, [tab, session]);
 
   if (loading) return <div className="skeleton" style={{ height: 200 }} />;
@@ -82,7 +112,7 @@ export default function AdminPage() {
       {msg && <div className="alert alert-success" role="status">{msg}</div>}
       {error && <div className="alert alert-error" role="alert">{error}</div>}
       <div className="admin-tabs" role="tablist" aria-label="Admin sections">
-        {(['products', 'inventory', 'orders', 'shipments', 'system'] as Tab[]).map((t) => (
+        {(['products', 'inventory', 'orders', 'shipments', 'reports', 'system'] as Tab[]).map((t) => (
           <button key={t} role="tab" aria-selected={tab === t} className={`admin-tab ${tab === t ? 'active' : ''}`} onClick={() => setTab(t)}>{t[0].toUpperCase() + t.slice(1)}</button>
         ))}
       </div>
@@ -140,6 +170,48 @@ export default function AdminPage() {
             <tbody>{shipments.map((s) => <tr key={s._id}><td>{s._id}</td><td>{s.orderId}</td><td>{s.state}</td><td>{new Date(s.updatedAt).toLocaleString('en-IN')}</td><td><button className="btn btn-secondary" style={{ padding: '4px 10px', fontSize: 12 }} onClick={() => addShipmentEvent(s.orderId)}>Advance</button></td></tr>)}</tbody>
           </table>
           <p className="muted" style={{ fontSize: 12 }}>Lifecycle: CREATED → LABELLED → IN_TRANSIT → OUT_FOR_DELIVERY → DELIVERED.</p>
+        </div>
+      )}
+
+      {tab === 'reports' && (
+        <div className="card">
+          <h2 style={{ fontSize: 16, marginTop: 0 }}>Reports <span className="muted" style={{ fontSize: 12, fontWeight: 400 }}>· powered by the H2 + Spring Boot reporting service</span></h2>
+          <div className="stats-row" style={{ marginBottom: 14 }}>
+            <div className="stat-card"><span className="stat-label">Revenue (GMV)</span><span className="stat-value">{reportSummary ? formatPrice(reportSummary.gmvPaise) : '…'}</span></div>
+            <div className="stat-card"><span className="stat-label">Orders</span><span className="stat-value">{reportSummary ? `${reportSummary.revenueOrders} / ${reportSummary.totalOrders}` : '…'}</span><span className="stat-sub">paid of total</span></div>
+            <div className="stat-card"><span className="stat-label">Avg order value</span><span className="stat-value">{reportSummary ? formatPrice(reportSummary.averageOrderValuePaise) : '…'}</span></div>
+            <div className="stat-card"><span className="stat-label">Units sold</span><span className="stat-value">{reportSummary ? reportSummary.unitsSold : '…'}</span></div>
+          </div>
+          {reportSummary && (
+            <p className="muted" style={{ fontSize: 12 }}>By state: {Object.entries(reportSummary.byState).map(([k, v]) => `${k}: ${v}`).join(' · ')}</p>
+          )}
+          <div className="cart-layout" style={{ marginTop: 10 }}>
+            <div>
+              <h3 style={{ fontSize: 13, margin: '4px 0' }}>Top products (by revenue)</h3>
+              <table className="admin">
+                <thead><tr><th>SKU</th><th>Title</th><th>Units</th><th>Revenue</th></tr></thead>
+                <tbody>{reportTop.map((p) => <tr key={p.sku}><td>{p.sku}</td><td>{p.title}</td><td>{p.units}</td><td>{formatPrice(p.revenuePaise)}</td></tr>)}</tbody>
+              </table>
+            </div>
+            <div>
+              <h3 style={{ fontSize: 13, margin: '4px 0' }}>Revenue last 7 days</h3>
+              <table className="admin">
+                <thead><tr><th>Date</th><th>Orders</th><th>Revenue</th></tr></thead>
+                <tbody>{reportDaily.map((d) => <tr key={d.date}><td>{d.date}</td><td>{d.orders}</td><td>{formatPrice(d.revenuePaise)}</td></tr>)}</tbody>
+              </table>
+              <h3 style={{ fontSize: 13, margin: '10px 0 4px' }}>Orders by state</h3>
+              <table className="admin">
+                <thead><tr><th>State</th><th>Count</th></tr></thead>
+                <tbody>{reportStates.map((s) => <tr key={s.state}><td>{s.state}</td><td>{s.count}</td></tr>)}</tbody>
+              </table>
+              <hr className="divider" />
+              <p className="muted" style={{ fontSize: 12 }}>
+                Sync: {reportStatus?.lastSyncAt ? new Date(reportStatus.lastSyncAt).toLocaleString('en-IN') : 'never'} · {reportStatus?.ordersInH2 ?? 0} orders in H2
+                {reportStatus?.lastError && <span className="form-error"> · last error: {reportStatus.lastError}</span>}
+              </p>
+              <button className="btn btn-orange" onClick={async () => { setMsg(''); await api.post('/v1/admin/reports/sync').catch((e: any) => setError(e.message)); await loadReports(); setMsg('Reports data refreshed from the order service.'); }}>Refresh reports now</button>
+            </div>
+          </div>
         </div>
       )}
 
