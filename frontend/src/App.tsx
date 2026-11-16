@@ -15,12 +15,16 @@ import RegisterPage from './pages/RegisterPage';
 import AdminPage from './pages/AdminPage';
 
 export default function App() {
+  const scrollToMain = () => {
+    document.getElementById('main-content')?.scrollIntoView({ behavior: 'smooth', block: 'start' });
+    document.getElementById('main-content')?.focus({ preventScroll: true });
+  };
   return (
     <SessionProvider>
-      <a className="skip-link" href="#main-content">Skip to main content</a>
+      <a className="skip-link" href="#main-content" onClick={(e) => { e.preventDefault(); scrollToMain(); }}>Skip to main content</a>
       <Header />
       <div aria-live="polite" className="sr-only" id="status-region" />
-      <main id="main-content" className="container">
+      <main id="main-content" className="container" tabIndex={-1}>
         <Routes>
           <Route path="/" element={<Home />} />
           <Route path="/c/:category" element={<CategoryPage />} />
@@ -37,7 +41,7 @@ export default function App() {
           <Route path="*" element={<div className="card"><h1>Page not found</h1><p><Link to="/">Back to Bazaarly home</Link></p></div>} />
         </Routes>
       </main>
-      <a className="back-top" href="#main-content">Back to top</a>
+      <button className="back-top" onClick={scrollToMain}>Back to top</button>
       <footer className="footer" role="contentinfo">
         <p><strong>Bazaarly</strong> — a demo marketplace. Single merchant, INR pricing, sandbox payments only. No real orders are placed.</p>
         <p>Need help? Visit <Link to="/notifications">your notifications</Link> · <Link to="/orders">track orders</Link> · <Link to="/login">account</Link></p>
