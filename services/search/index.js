@@ -62,8 +62,8 @@ app.get('/v1/search', asyncH(async (req, res) => {
   let usedText = false;
   if (q && q.trim()) { filter.$text = { $search: q.trim() }; usedText = true; }
 
-  const sortSpec = sort === 'price_asc' ? { price: 1, _id: 1 } : sort === 'price_desc' ? { price: -1, _id: 1 } : usedText ? { score: { $meta: 'textScore' }, _id: 1 } : { _id: 1 };
-  const projection = usedText && sort === 'relevance' ? { score: { $meta: 'textScore' } } : {};
+  let sortSpec = sort === 'price_asc' ? { price: 1, _id: 1 } : sort === 'price_desc' ? { price: -1, _id: 1 } : usedText ? { score: { $meta: 'textScore' }, _id: 1 } : { _id: 1 };
+  let projection = usedText && sort === 'relevance' ? { score: { $meta: 'textScore' } } : {};
 
   const runQuery = async (f) => {
     let query = Doc.find(f, projection).sort(sortSpec);
@@ -72,9 +72,11 @@ app.get('/v1/search', asyncH(async (req, res) => {
   };
 
   let docs = await runQuery(filter);
-  // Regex fallback when $text finds nothing
+  // Regex fallback when $text finds nothing — drop textScore sort/projection too
   if (usedText && docs.length === 0 && q.trim()) {
     delete filter.$text;
+    sortSpec = sort === 'price_asc' ? { price: 1, _id: 1 } : sort === 'price_desc' ? { price: -1, _id: 1 } : { _id: 1 };
+    projection = {};
     const rx = new RegExp(q.trim().replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'i');
     filter.$or = [{ title: rx }, { description: rx }, { brand: rx }, { sku: rx }];
     docs = await runQuery(filter);
